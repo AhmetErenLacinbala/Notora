@@ -4,6 +4,8 @@ A small shared PDF workspace. Open a PDF, double-click beside a page to write a 
 
 No accounts, drawing tools, or rich-text editor. Notes use plain text and literal newlines. They can extend outside a PDF page and across page boundaries.
 
+Notes have a translucent pink fill and border. Select a note to show its two font-size buttons; drag its border to move it. Shift-click toggles multiple selections. Delete/Backspace removes selected boxes when focus is outside their text; inside a note it edits text normally.
+
 ## Storage
 
 - **Server:** original PDF, individual page PDFs, page sizes, navigation metadata, and hashed access tokens. Docker stores these in the `notora-data` volume.
@@ -15,6 +17,8 @@ Editing is immediate. Note persistence waits for **10 seconds without input**; h
 PDFs remain available when the creator is offline, but notes can only be restored from a browser that has saved them. Clearing that browser's site data removes its notes and creator history. An access link grants reading and editing to anyone holding it; names do not establish ownership. The owner's additional token stays in their browser.
 
 ## Large PDFs
+
+Uploads use sequential, adaptive HTTP chunks (16 KiB–1 MiB) written into one temporary file. Each request stays short enough for the shared proxy, with bounded retries and an offset check after interrupted requests. No full-file browser buffer or permanent chunk files are created. Incomplete upload sessions expire after 30 idle minutes; a server restart requires restarting an unfinished upload.
 
 The server processes one PDF job at a time using qpdf and pypdf. It derives displayed page geometry (crop, rotation, and user units), outline destinations, and internal links before extracting standalone pages in a single qpdf pass.
 
@@ -60,7 +64,7 @@ docker compose up -d
 docker compose ps
 ```
 
-Set `NOTORA_VERSION` and `REVISION` to the release commit when deploying. Defaults cap each upload at 256 MiB and total PDF storage at 2048 MiB; these can be changed in `.env`. Derived page PDFs can be larger in aggregate than the original because shared resources may be repeated. The service has bounded memory/CPU and log rotation.
+Set `NOTORA_VERSION` and `NOTORA_REVISION` to the release commit when deploying. Defaults cap each upload at 256 MiB and total PDF storage at 2048 MiB; these can be changed in `.env`. Derived page PDFs can be larger in aggregate than the original because shared resources may be repeated. The service has bounded memory/CPU and log rotation.
 
 `GET /healthz` returns status and the deployed revision. To back up PDFs, back up the `notora-data` volume; that volume does **not** contain browser-local notes. Never use `docker compose down -v` on a deployment whose PDFs should be preserved.
 

@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import type { ClientMessage, DocumentManifest, ServerMessage, SessionOptions } from '../../../../packages/shared/src/index';
+import {
+  noteFontSize, type ClientMessage, type DocumentManifest, type NoteMeta,
+  type ServerMessage, type SessionOptions,
+} from '../../../../packages/shared/src/index';
 
 const persistence = vi.hoisted(() => ({
   states: new Map<string, Uint8Array>(),
@@ -20,7 +23,7 @@ vi.mock('./storage', () => ({
 }));
 
 import { WorkspaceSession } from './workspace';
-import { saveYUpdates } from './storage';
+import { getYState, saveYUpdates } from './storage';
 
 class Socket {
   static OPEN = 1;
@@ -69,6 +72,7 @@ function updateFor(socket: Socket, key: string): Extract<ClientMessage, { type: 
 
 describe('WorkspaceSession', () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     persistence.states.clear();
     persistence.saves.length = 0;
     Socket.instances.length = 0;
@@ -129,6 +133,113 @@ describe('WorkspaceSession', () => {
     expect(restored.getText('text').toString()).toBe('guest edit');
     await owner.destroy();
     await guest.destroy();
+  });
+
+  it('reads an old note without font metadata, then saves font and position without loading offscreen text', async () => {
+    const id = 'legacy-note';
+    const index = new Y.Doc();
+    index.getMap<NoteMeta>('notes').set(id, { id, anchorPage: 1, x: 20, y: 700, lineCount: 2 });
+    persistence.states.set('document:index', Y.encodeStateAsUpdate(index));
+    const body = new Y.Doc();
+    body.getText('text').insert(0, 'old\nnote');
+    persistence.states.set(`document:note:${id}`, Y.encodeStateAsUpdate(body));
+
+    const session = new WorkspaceSession(options(true));
+    session.setVisibleRange(0, 100);
+    const socket = await online(session);
+    expect(session.getSnapshot().notes[0]).toMatchObject({ id, x: 20, y: 700, lineCount: 2, text: null });
+    expect(noteFontSize(session.getSnapshot().notes[0])).toBe(18);
+    expect(vi.mocked(getYState)).not.toHaveBeenCalledWith('document', `note:${id}`);
+
+    const indexUpdates = () => socket.sent.filter(message => message.type === 'update' && message.key === 'index').length;
+    const beforeInvalid = indexUpdates();
+    session.updateNote(id, { x: Number.NaN, fontSize: 24 });
+    session.updateNote(id, { fontSize: 73 });
+    session.updateNote(id, { x: Number.POSITIVE_INFINITY });
+    expect(indexUpdates()).toBe(beforeInvalid);
+
+    session.updateNote(id, { x: 50, fontSize: 24 });
+    expect(session.getSnapshot().notes[0]).toMatchObject({ x: 50, y: 700, lineCount: 2, fontSize: 24, text: null });
+    expect(vi.mocked(getYState)).not.toHaveBeenCalledWith('document', `note:${id}`);
+    session.updateNote(id, { y: 20 });
+    await vi.waitFor(() => expect(session.getSnapshot().notes[0]?.text).toBe('old\nnote'));
+    expect(session.getSnapshot().notes[0]).toMatchObject({ x: 50, y: 20, fontSize: 24, lineCount: 2 });
+
+    vi.useFakeTimers();
+    session.activity();
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(persistence.saves).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(session.getSnapshot().saveState).toBe('saved');
+    await session.destroy();
+
+    vi.useRealTimers();
+    Socket.instances.length = 0;
+    const reopened = new WorkspaceSession(options(true));
+    reopened.setVisibleRange(0, 100);
+    await online(reopened);
+    await vi.waitFor(() => expect(reopened.getSnapshot().notes[0]?.text).toBe('old\nnote'));
+    expect(reopened.getSnapshot().notes[0]).toMatchObject({ x: 50, y: 20, fontSize: 24, lineCount: 2 });
+    await reopened.destroy();
+  });
+
+  it('syncs note font and position to an offscreen owner without loading the body', async () => {
+    const owner = new WorkspaceSession(options(true));
+    const guest = new WorkspaceSession(options());
+    const ownerSocket = await online(owner);
+    const guestSocket = await online(guest);
+    owner.setVisibleRange(0, 100);
+    const id = guest.createNote(1, 20, 700);
+    ownerSocket.receive({ type: 'update', key: 'index', update: updateFor(guestSocket, 'index').update });
+    guest.setNoteText(id, 'guest\ntext');
+    ownerSocket.receive({ type: 'update', key: 'index', update: updateFor(guestSocket, 'index').update });
+    expect(owner.getSnapshot().notes[0]).toMatchObject({ id, lineCount: 2, fontSize: 18, text: null });
+    ownerSocket.receive({ type: 'update', key: `note:${id}`, update: updateFor(guestSocket, `note:${id}`).update });
+
+    guest.updateNote(id, { x: 125, y: 720, fontSize: 28 });
+    ownerSocket.receive({ type: 'update', key: 'index', update: updateFor(guestSocket, 'index').update });
+    expect(owner.getSnapshot().notes[0]).toMatchObject({ x: 125, y: 720, fontSize: 28, lineCount: 2, text: null });
+    guest.setNoteText(id, 'guest\ntext\nmore');
+    ownerSocket.receive({ type: 'update', key: 'index', update: updateFor(guestSocket, 'index').update });
+    ownerSocket.receive({ type: 'update', key: `note:${id}`, update: updateFor(guestSocket, `note:${id}`).update });
+    expect(owner.getSnapshot().notes[0]).toMatchObject({ x: 125, y: 720, fontSize: 28, lineCount: 3, text: null });
+    expect(vi.mocked(getYState)).not.toHaveBeenCalledWith('document', `note:${id}`);
+    await owner.flush();
+    await owner.destroy();
+    await guest.destroy();
+
+    Socket.instances.length = 0;
+    const reopened = new WorkspaceSession(options(true));
+    reopened.setVisibleRange(700, 850);
+    await online(reopened);
+    await vi.waitFor(() => expect(reopened.getSnapshot().notes[0]?.text).toBe('guest\ntext\nmore'));
+    expect(reopened.getSnapshot().notes[0]).toMatchObject({ x: 125, y: 720, fontSize: 28, lineCount: 3 });
+    await reopened.destroy();
+  });
+
+  it('deletes selected notes in one index update and preserves unselected notes', async () => {
+    const session = new WorkspaceSession(options(true));
+    const socket = await online(session);
+    const first = session.createNote(1, 10, 10);
+    const second = session.createNote(1, 20, 20);
+    const keep = session.createNote(1, 30, 30);
+    session.setNoteText(keep, 'keep me');
+    const beforeDelete = socket.sent.filter(message => message.type === 'update' && message.key === 'index').length;
+    session.deleteNotes([first, second, first, 'missing']);
+    expect(socket.sent.filter(message => message.type === 'update' && message.key === 'index')).toHaveLength(beforeDelete + 1);
+    expect(session.getSnapshot().notes).toEqual([expect.objectContaining({ id: keep, text: 'keep me' })]);
+    await session.flush();
+    await session.destroy();
+
+    Socket.instances.length = 0;
+    const reopened = new WorkspaceSession(options(true));
+    reopened.setVisibleRange(0, 100);
+    await online(reopened);
+    await vi.waitFor(() => expect(reopened.getSnapshot().notes[0]?.text).toBe('keep me'));
+    expect(reopened.getSnapshot().notes.map(note => note.id)).toEqual([keep]);
+    reopened.deleteNote(keep);
+    expect(reopened.getSnapshot().notes).toHaveLength(0);
+    await reopened.destroy();
   });
 
   it('merges simultaneous textarea insertions from two clients without replacing the full text', async () => {

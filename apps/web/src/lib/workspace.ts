@@ -1,7 +1,8 @@
 import * as Y from 'yjs';
 import {
-  INDEX_KEY, SAVE_IDLE_MS, noteIntersects, noteKey, pageLayout,
-  type ClientMessage, type CursorPosition, type NoteMeta, type Participant,
+  INDEX_KEY, MAX_NOTE_FONT_SIZE, MIN_NOTE_FONT_SIZE, SAVE_IDLE_MS, TEXT_FONT_SIZE,
+  noteIntersects, noteKey, pageLayout,
+  type ClientMessage, type CursorPosition, type NoteMeta, type NotePatch, type Participant,
   type SessionOptions, type ServerMessage, type TextNote, type WorkspaceSessionApi,
   type WorkspaceSnapshot,
 } from '../../../../packages/shared/src/index';
@@ -185,7 +186,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     this.attachBody(id, doc);
     this.bodies.set(id, doc);
     this.editingNoteId = id;
-    this.metadata.set(id, { id, anchorPage, x, y, lineCount: 1 });
+    this.metadata.set(id, { id, anchorPage, x, y, lineCount: 1, fontSize: TEXT_FONT_SIZE });
     this.refreshNotes();
     this.refreshVisibleNotes();
     return id;
@@ -222,11 +223,46 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     }, 'local');
   }
 
+  updateNote(id: string, patch: NotePatch): void {
+    const previous = this.metadata.get(id);
+    if (!previous || !patch || typeof patch !== 'object') return;
+    const changes: NotePatch = {};
+    if (Object.hasOwn(patch, 'x')) {
+      if (typeof patch.x !== 'number' || !Number.isFinite(patch.x)) return;
+      if (patch.x !== previous.x) changes.x = patch.x;
+    }
+    if (Object.hasOwn(patch, 'y')) {
+      if (typeof patch.y !== 'number' || !Number.isFinite(patch.y)) return;
+      if (patch.y !== previous.y) changes.y = patch.y;
+    }
+    if (Object.hasOwn(patch, 'fontSize')) {
+      if (typeof patch.fontSize !== 'number' || !Number.isFinite(patch.fontSize) ||
+          patch.fontSize < MIN_NOTE_FONT_SIZE || patch.fontSize > MAX_NOTE_FONT_SIZE) return;
+      if (patch.fontSize !== previous.fontSize) changes.fontSize = patch.fontSize;
+    }
+    if (Object.keys(changes).length === 0) return;
+    // Always merge against the current index entry so position/font edits retain
+    // the latest line count and old records without fontSize remain readable.
+    this.metadata.set(id, { ...previous, ...changes });
+  }
+
   deleteNote(id: string): void {
-    if (!this.metadata.has(id)) return;
-    this.metadata.delete(id);
-    this.pendingText.delete(id);
-    if (this.editingNoteId === id) this.editingNoteId = null;
+    this.deleteNotes([id]);
+  }
+
+  deleteNotes(ids: string[]): void {
+    const unique = [...new Set(ids)].filter(id => this.metadata.has(id));
+    if (unique.length === 0) return;
+    this.index.transact(() => {
+      for (const id of unique) this.metadata.delete(id);
+    }, 'local');
+    for (const id of unique) {
+      this.pendingText.delete(id);
+      this.unsentUpdates.delete(noteKey(id));
+      this.bodies.get(id)?.destroy();
+      this.bodies.delete(id);
+      if (this.editingNoteId === id) this.editingNoteId = null;
+    }
     this.refreshVisibleNotes();
   }
 

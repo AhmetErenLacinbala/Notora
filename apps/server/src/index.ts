@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import Fastify, { type FastifyInstance } from 'fastify';
 import multipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
+import { MAX_UPLOAD_CHUNK_BYTES } from '../../../packages/shared/src/index.ts';
 import { defaultPdfTools, type PdfTools } from './pdf.ts';
 import { attachRelay } from './relay.ts';
 import { DocumentStore, UploadError } from './store.ts';
@@ -30,14 +31,18 @@ function bearer(header: unknown): string | null {
   return match?.[1] ?? null;
 }
 
-function routeError(error: unknown): { statusCode: number; message: string } {
-  if (error instanceof UploadError) return { statusCode: error.statusCode, message: error.message };
+function routeError(error: unknown): { statusCode: number; message: string; offset?: number } {
+  if (error instanceof UploadError) return { statusCode: error.statusCode, message: error.message, offset: error.offset };
   const code = (error as { code?: string }).code;
   if (code === 'FST_REQ_FILE_TOO_LARGE') return { statusCode: 413, message: 'PDF exceeds upload limit' };
   if (code === 'FST_FILES_LIMIT' || code === 'FST_FIELDS_LIMIT' || code === 'FST_PARTS_LIMIT') {
     return { statusCode: 400, message: 'Upload one PDF file' };
   }
   return { statusCode: 500, message: 'Upload failed' };
+}
+
+function errorBody(error: { message: string; offset?: number }): { error: string; offset?: number } {
+  return error.offset === undefined ? { error: error.message } : { error: error.message, offset: error.offset };
 }
 
 export async function createServer(options: Options = {}): Promise<{ app: FastifyInstance; store: DocumentStore }> {
@@ -54,6 +59,8 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
     limits: { fileSize: maxUploadBytes, files: 1, fields: 0, parts: 1 },
     throwFileSizeLimit: true,
   });
+  app.addContentTypeParser('application/octet-stream', (_request, payload, done) => done(null, payload));
+  app.addHook('onClose', async () => { store.close(); });
 
   app.get('/healthz', async () => ({ status: 'ok', revision }));
 
@@ -75,7 +82,60 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
       return reply.code(202).send(result);
     } catch (error) {
       const response = routeError(error);
-      return reply.code(response.statusCode).send({ error: response.message });
+      return reply.code(response.statusCode).send(errorBody(response));
+    }
+  });
+
+  app.post('/api/uploads', async (request, reply) => {
+    try {
+      const body = request.body as { filename?: unknown; size?: unknown } | null;
+      const session = await store.createUploadSession(body?.filename, body?.size);
+      return reply.code(201).send(session);
+    } catch (error) {
+      const response = routeError(error);
+      return reply.code(response.statusCode).send(errorBody(response));
+    }
+  });
+
+  app.get<{ Params: { id: string } }>('/api/uploads/:id', async (request, reply) => {
+    const token = bearer(request.headers.authorization);
+    if (!token) return reply.code(401).send({ error: 'Upload unavailable' });
+    try { return store.getUploadStatus(request.params.id, token); }
+    catch (error) {
+      const response = routeError(error);
+      return reply.code(response.statusCode).send(errorBody(response));
+    }
+  });
+
+  app.put<{ Params: { id: string } }>('/api/uploads/:id', { bodyLimit: MAX_UPLOAD_CHUNK_BYTES }, async (request, reply) => {
+    const token = bearer(request.headers.authorization);
+    if (!token) return reply.code(401).send({ error: 'Upload unavailable' });
+    if (request.headers['content-type'] !== 'application/octet-stream') {
+      return reply.code(415).send({ error: 'Upload an octet-stream chunk' });
+    }
+    const rawOffset = request.headers['upload-offset'];
+    if (typeof rawOffset !== 'string' || !/^(0|[1-9]\d*)$/.test(rawOffset)) {
+      return reply.code(400).send({ error: 'Invalid upload offset' });
+    }
+    const contentLength = request.headers['content-length'];
+    if (typeof contentLength === 'string' && Number(contentLength) > MAX_UPLOAD_CHUNK_BYTES) {
+      return reply.code(413).send({ error: 'Upload chunk exceeds limit' });
+    }
+    try {
+      return await store.appendUploadChunk(request.params.id, token, Number(rawOffset), request.body as NodeJS.ReadableStream);
+    } catch (error) {
+      const response = routeError(error);
+      return reply.code(response.statusCode).send(errorBody(response));
+    }
+  });
+
+  app.post<{ Params: { id: string } }>('/api/uploads/:id/complete', async (request, reply) => {
+    const token = bearer(request.headers.authorization);
+    if (!token) return reply.code(401).send({ error: 'Upload unavailable' });
+    try { return reply.code(202).send(await store.completeUpload(request.params.id, token)); }
+    catch (error) {
+      const response = routeError(error);
+      return reply.code(response.statusCode).send(errorBody(response));
     }
   });
 

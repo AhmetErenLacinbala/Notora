@@ -1,11 +1,12 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PassThrough, Readable } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import * as Y from 'yjs';
 import type { FastifyInstance } from 'fastify';
-import type { ServerMessage, UploadResult } from '../../../packages/shared/src/index.ts';
+import { MAX_UPLOAD_CHUNK_BYTES, type ServerMessage, type UploadResult, type UploadSession } from '../../../packages/shared/src/index.ts';
 import { createServer } from './index.ts';
 import type { PdfTools } from './pdf.ts';
 
@@ -34,9 +35,9 @@ function fakeTools(onExtract?: () => Promise<void>): PdfTools {
   };
 }
 
-async function setup(tools = fakeTools(), options: { maxUploadMb?: number; dataDir?: string } = {}) {
+async function setup(tools = fakeTools(), options: { maxUploadMb?: number; storageBudgetMb?: number; dataDir?: string } = {}) {
   const dir = options.dataDir ?? await mkdtemp(join(tmpdir(), 'notora-test-'));
-  const { app, store } = await createServer({ dataDir: dir, webDir: join(dir, 'no-web-build'), pdfTools: tools, maxUploadMb: options.maxUploadMb });
+  const { app, store } = await createServer({ dataDir: dir, webDir: join(dir, 'no-web-build'), pdfTools: tools, maxUploadMb: options.maxUploadMb, storageBudgetMb: options.storageBudgetMb });
   resources.push(async () => { await store.waitForIdle(); await app.close(); if (!options.dataDir) await rm(dir, { recursive: true, force: true }); });
   return { app, store, dir };
 }
@@ -57,6 +58,20 @@ async function upload(app: FastifyInstance): Promise<UploadResult> {
   const response = await app.inject({ method: 'POST', url: '/api/documents', ...multipartPayload() });
   expect(response.statusCode).toBe(202);
   return response.json() as UploadResult;
+}
+
+async function beginUpload(app: FastifyInstance, size = pdf.length, filename = 'A Book.pdf'): Promise<UploadSession> {
+  const response = await app.inject({ method: 'POST', url: '/api/uploads', payload: { filename, size } });
+  expect(response.statusCode).toBe(201);
+  return response.json() as UploadSession;
+}
+
+function uploadHeaders(session: UploadSession, offset = 0) {
+  return {
+    authorization: `Bearer ${session.uploadToken}`,
+    'content-type': 'application/octet-stream',
+    'upload-offset': String(offset),
+  };
 }
 
 class Messages {
@@ -176,6 +191,130 @@ describe('Notora server', () => {
     const response = await limited.app.inject({ method: 'POST', url: '/api/documents', ...multipartPayload(Buffer.concat([pdf, Buffer.alloc(100)])) });
     expect(response.statusCode).toBe(413);
     expect(limited.store.documents.size).toBe(0);
+  });
+
+  it('streams sequential chunks with private status, offset conflicts, durable completion and idempotent retry', async () => {
+    const { app, store, dir } = await setup();
+    const session = await beginUpload(app, pdf.length, '../A Book.pdf');
+    const route = `/api/uploads/${session.uploadId}`;
+    expect((await app.inject({ method: 'GET', url: route })).statusCode).toBe(401);
+    expect((await app.inject({ method: 'GET', url: route, headers: { authorization: 'Bearer wrong' } })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'POST', url: `${route}/complete`, headers: { authorization: `Bearer ${session.uploadToken}` } })).json()).toMatchObject({ offset: 0 });
+
+    const first = pdf.subarray(0, 7);
+    const sent = await app.inject({ method: 'PUT', url: route, headers: uploadHeaders(session), payload: first });
+    expect(sent.statusCode).toBe(200);
+    expect(sent.json()).toEqual({ offset: 7 });
+    const duplicate = await app.inject({ method: 'PUT', url: route, headers: uploadHeaders(session), payload: first });
+    expect(duplicate.statusCode).toBe(409);
+    expect(duplicate.json()).toMatchObject({ offset: 7 });
+    expect((await app.inject({ method: 'GET', url: route, headers: { authorization: `Bearer ${session.uploadToken}` } })).json()).toEqual({ offset: 7, size: pdf.length });
+    const rest = await app.inject({ method: 'PUT', url: route, headers: uploadHeaders(session, 7), payload: pdf.subarray(7) });
+    expect(rest.json()).toEqual({ offset: pdf.length });
+    const complete = await app.inject({ method: 'POST', url: `${route}/complete`, headers: { authorization: `Bearer ${session.uploadToken}` } });
+    expect(complete.statusCode).toBe(202);
+    const result = complete.json() as UploadResult;
+    expect((await app.inject({ method: 'POST', url: `${route}/complete`, headers: { authorization: `Bearer ${session.uploadToken}` } })).json()).toEqual(result);
+    expect((await readFile(join(dir, 'documents', result.documentId, 'original.pdf'))).equals(pdf)).toBe(true);
+    const record = await readFile(join(dir, 'documents', result.documentId, 'record.json'), 'utf8');
+    expect(record).not.toContain(session.uploadToken);
+    expect(record).not.toContain(result.accessToken);
+    expect(record).not.toContain(result.ownerToken);
+    await store.waitForIdle();
+    const manifest = await app.inject({ method: 'GET', url: `/api/documents/${result.documentId}`, headers: { authorization: `Bearer ${result.accessToken}` } });
+    expect(manifest.json()).toMatchObject({ status: 'ready', title: 'A Book' });
+  });
+
+  it('returns 202 before validation, then records invalid PDFs as errors', async () => {
+    let release!: () => void;
+    const validation = new Promise<void>(resolve => { release = resolve; });
+    const tools = fakeTools();
+    tools.validate = async () => { await validation; throw new Error('Invalid PDF'); };
+    const { app, store } = await setup(tools);
+    const pending = app.inject({ method: 'POST', url: '/api/documents', ...multipartPayload() });
+    const early = await Promise.race([pending.then(() => true), new Promise<false>(resolve => setTimeout(() => resolve(false), 300))]);
+    release();
+    expect(early).toBe(true);
+    const response = await pending;
+    expect(response.statusCode).toBe(202);
+    const result = response.json() as UploadResult;
+    await store.waitForIdle();
+    const manifest = await app.inject({ method: 'GET', url: `/api/documents/${result.documentId}`, headers: { authorization: `Bearer ${result.accessToken}` } });
+    expect(manifest.json()).toMatchObject({ status: 'error', error: 'This PDF could not be prepared.' });
+  });
+
+  it('rejects non-PDF headers and rolls back failed or overlapping chunks', async () => {
+    const { app, store, dir } = await setup();
+    const bad = await beginUpload(app, 5);
+    const badRoute = `/api/uploads/${bad.uploadId}`;
+    expect((await app.inject({ method: 'PUT', url: badRoute, headers: uploadHeaders(bad), payload: Buffer.from('hello') })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: `${badRoute}/complete`, headers: { authorization: `Bearer ${bad.uploadToken}` } })).statusCode).toBe(415);
+    expect((await app.inject({ method: 'GET', url: badRoute, headers: { authorization: `Bearer ${bad.uploadToken}` } })).statusCode).toBe(404);
+
+    const session = await beginUpload(app);
+    const path = join(dir, 'incoming', `${session.uploadId}.part`);
+    async function* broken() { yield pdf.subarray(0, 8); throw new Error('Connection broke'); }
+    await expect(store.appendUploadChunk(session.uploadId, session.uploadToken, 0, Readable.from(broken()))).rejects.toThrow('Connection broke');
+    expect((await stat(path)).size).toBe(0);
+    expect(store.getUploadStatus(session.uploadId, session.uploadToken)).toEqual({ offset: 0, size: pdf.length });
+    const slow = new PassThrough();
+    const first = store.appendUploadChunk(session.uploadId, session.uploadToken, 0, slow);
+    await expect(store.appendUploadChunk(session.uploadId, session.uploadToken, 0, Readable.from(pdf))).rejects.toMatchObject({ statusCode: 409, offset: 0 });
+    slow.end(pdf);
+    expect(await first).toEqual({ offset: pdf.length });
+  });
+
+  it('retires a session when a failed chunk cannot be truncated', async () => {
+    const { app, store, dir } = await setup(fakeTools(), { storageBudgetMb: 0.003 });
+    const session = await beginUpload(app);
+    const path = join(dir, 'incoming', `${session.uploadId}.part`);
+    const source = new PassThrough();
+    const pending = store.appendUploadChunk(session.uploadId, session.uploadToken, 0, source);
+    source.write(pdf.subarray(0, 8));
+    let written = false;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if ((await stat(path)).size === 8) { written = true; break; }
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    expect(written).toBe(true);
+    await rm(path);
+    source.destroy(new Error('Connection lost'));
+    await expect(pending).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(() => store.getUploadStatus(session.uploadId, session.uploadToken)).toThrow();
+    expect((await app.inject({ method: 'GET', url: `/api/uploads/${session.uploadId}`, headers: { authorization: `Bearer ${session.uploadToken}` } })).statusCode).toBe(404);
+    await beginUpload(app); // The retired partial no longer holds storage quota.
+  });
+
+  it('bounds chunk size and active session storage, releasing expired partial uploads', async () => {
+    const { app, store, dir } = await setup(fakeTools(), { storageBudgetMb: 0.003 });
+    const session = await beginUpload(app, pdf.length);
+    expect((await app.inject({ method: 'POST', url: '/api/uploads', payload: { filename: 'Second.pdf', size: pdf.length } })).statusCode).toBe(507);
+    const route = `/api/uploads/${session.uploadId}`;
+    const tooLarge = await app.inject({ method: 'PUT', url: route, headers: uploadHeaders(session), payload: Buffer.alloc(MAX_UPLOAD_CHUNK_BYTES + 1) });
+    expect(tooLarge.statusCode).toBe(413);
+    await expect(store.appendUploadChunk(session.uploadId, session.uploadToken, 0, Readable.from([Buffer.alloc(MAX_UPLOAD_CHUNK_BYTES + 1)]))).rejects.toMatchObject({ statusCode: 413 });
+    expect(store.getUploadStatus(session.uploadId, session.uploadToken).offset).toBe(0);
+    expect((await stat(join(dir, 'incoming', `${session.uploadId}.part`))).size).toBe(0);
+    await store.expireIdleUploads(Date.now() + 30 * 60 * 1000 + 1);
+    expect((await app.inject({ method: 'GET', url: route, headers: { authorization: `Bearer ${session.uploadToken}` } })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'POST', url: '/api/uploads', payload: { filename: 'Second.pdf', size: pdf.length } })).statusCode).toBe(201);
+  });
+
+  it('accepts a full 1 MiB chunk followed by the final byte', async () => {
+    const { app, dir } = await setup();
+    const source = Buffer.alloc(MAX_UPLOAD_CHUNK_BYTES + 1);
+    pdf.copy(source);
+    const session = await beginUpload(app, source.length);
+    const route = `/api/uploads/${session.uploadId}`;
+    const first = await app.inject({ method: 'PUT', url: route, headers: uploadHeaders(session), payload: source.subarray(0, MAX_UPLOAD_CHUNK_BYTES) });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toEqual({ offset: MAX_UPLOAD_CHUNK_BYTES });
+    const last = await app.inject({ method: 'PUT', url: route, headers: uploadHeaders(session, MAX_UPLOAD_CHUNK_BYTES), payload: source.subarray(MAX_UPLOAD_CHUNK_BYTES) });
+    expect(last.json()).toEqual({ offset: source.length });
+    const complete = await app.inject({ method: 'POST', url: `${route}/complete`, headers: { authorization: `Bearer ${session.uploadToken}` } });
+    expect(complete.statusCode).toBe(202);
+    const result = complete.json() as UploadResult;
+    expect((await readFile(join(dir, 'documents', result.documentId, 'original.pdf'))).equals(source)).toBe(true);
   });
 
   it('relays Yjs state to owners offscreen and releases room state after disconnect', async () => {
