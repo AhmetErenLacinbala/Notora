@@ -20,7 +20,7 @@ describe('cross-page note geometry', () => {
     expect(noteHeight(old)).toBe(92);
     expect(noteIntersects(old,pages,950,1000)).toBe(false);
     expect(noteIntersects({...old,fontSize:36},pages,950,1000)).toBe(true);
-    expect(noteFontSize({fontSize:0})).toBe(8);
+    expect(noteFontSize({fontSize:0})).toBe(1);
     expect(noteFontSize({fontSize:Infinity})).toBe(18);
     expect(noteFontSize({fontSize:100})).toBe(72);
   });

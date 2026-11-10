@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { Camera, CursorPosition, Destination, DocumentManifest, OutlineItem, PageLayout, Profile, TextNote } from '../../../../packages/shared/src/index';
-import { MAX_NOTE_FONT_SIZE, MIN_NOTE_FONT_SIZE, NOTE_BORDER, NOTE_FONT_STEP, NOTE_PADDING, noteFontSize, noteHeight, noteIntersects, noteLineHeight, pageLayout, PAGE_GAP, STAGE_MARGIN } from '../../../../packages/shared/src/index';
+import { MAX_NOTE_FONT_SIZE, MIN_NOTE_FONT_SIZE, NOTE_BORDER, NOTE_FONT_STEP, NOTE_PADDING, TEXT_FONT_SIZE, noteFontSize, noteHeight, noteIntersects, noteLineHeight, pageLayout, PAGE_GAP, STAGE_MARGIN } from '../../../../packages/shared/src/index';
 import { canvasPoint, intersectsRect, selectionRect, wheelPixels, zoomCameraAt } from '../lib/canvasGeometry';
 import type { CanvasPoint, CanvasRect } from '../lib/canvasGeometry';
 import { loadCamera, saveCamera } from '../lib/storage';
@@ -121,6 +121,7 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
   const cameraRef = useRef(camera);
   const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [nextNoteFontSize, setNextNoteFontSize] = useState(TEXT_FONT_SIZE);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const selectedIdsRef = useRef(selectedIds);
   const cameraReady = useRef(false);
@@ -493,7 +494,7 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
     const { x, y } = pointerOnCanvas(event.clientX, event.clientY);
     const page = nearestPage(pages, y);
     if (!page) return;
-    const id = session.createNote(page.number, x - page.x, y - page.y);
+    const id = session.createNote(page.number, x - page.x, y - page.y, nextNoteFontSize);
     newNoteIds.current.add(id);
     selectNote(id);
     setEditingId(id);
@@ -551,7 +552,11 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
                   session.deleteNote(note.id);
                 }
               }}
-              onFontChange={delta => session.updateNote(note.id, { fontSize: clamp(noteFontSize(note) + delta, MIN_NOTE_FONT_SIZE, MAX_NOTE_FONT_SIZE) })}
+              onFontChange={delta => {
+                const fontSize = clamp(noteFontSize(note) + delta, MIN_NOTE_FONT_SIZE, MAX_NOTE_FONT_SIZE);
+                session.updateNote(note.id, { fontSize });
+                setNextNoteFontSize(fontSize);
+              }}
               onBorderPointerDown={event => beginNoteDrag(note, event)}
               onBorderPointerMove={moveNoteDrag}
               onBorderPointerEnd={endNoteDrag}

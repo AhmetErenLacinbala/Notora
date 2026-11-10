@@ -189,11 +189,11 @@ describe('WorkspaceSession', () => {
     const ownerSocket = await online(owner);
     const guestSocket = await online(guest);
     owner.setVisibleRange(0, 100);
-    const id = guest.createNote(1, 20, 700);
+    const id = guest.createNote(1, 20, 700, 1);
     ownerSocket.receive({ type: 'update', key: 'index', update: updateFor(guestSocket, 'index').update });
     guest.setNoteText(id, 'guest\ntext');
     ownerSocket.receive({ type: 'update', key: 'index', update: updateFor(guestSocket, 'index').update });
-    expect(owner.getSnapshot().notes[0]).toMatchObject({ id, lineCount: 2, fontSize: 18, text: null });
+    expect(owner.getSnapshot().notes[0]).toMatchObject({ id, lineCount: 2, fontSize: 1, text: null });
     ownerSocket.receive({ type: 'update', key: `note:${id}`, update: updateFor(guestSocket, `note:${id}`).update });
 
     guest.updateNote(id, { x: 125, y: 720, fontSize: 28 });

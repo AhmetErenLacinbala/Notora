@@ -3,7 +3,7 @@ export const PAGE_GAP = 28;
 export const STAGE_MARGIN = 380;
 export const TEXT_FONT_SIZE = 18;
 export const TEXT_LINE_HEIGHT = 26;
-export const MIN_NOTE_FONT_SIZE = 8;
+export const MIN_NOTE_FONT_SIZE = 1;
 export const MAX_NOTE_FONT_SIZE = 72;
 export const NOTE_FONT_STEP = 2;
 export const NOTE_PADDING = 6;
@@ -46,7 +46,7 @@ export interface WorkspaceSessionApi {
   connect(): void; destroy(): Promise<void>; subscribe(listener: () => void): () => void;
   getSnapshot(): WorkspaceSnapshot; setVisibleRange(top: number, bottom: number): void;
   setEditingNote(id: string | null): void;
-  createNote(anchorPage: number, x: number, y: number): string;
+  createNote(anchorPage: number, x: number, y: number, fontSize?: number): string;
   setNoteText(id: string, text: string): void; deleteNote(id: string): void;
   updateNote(id: string, patch: NotePatch): void; deleteNotes(ids: string[]): void;
   setCursor(cursor: CursorPosition | null): void; activity(): void; flush(): Promise<void>;

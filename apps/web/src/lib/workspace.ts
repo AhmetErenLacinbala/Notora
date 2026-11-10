@@ -178,15 +178,18 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     this.send({ type: 'subscribe', keys: [...this.desired].map(noteKey) });
   }
 
-  createNote(anchorPage: number, x: number, y: number): string {
+  createNote(anchorPage: number, x: number, y: number, fontSize = TEXT_FONT_SIZE): string {
     if (!Number.isSafeInteger(anchorPage) || anchorPage < 1 || anchorPage > this.options.manifest.pageCount ||
         !Number.isFinite(x) || !Number.isFinite(y)) throw new Error('Invalid note position.');
+    if (!Number.isFinite(fontSize) || fontSize < MIN_NOTE_FONT_SIZE || fontSize > MAX_NOTE_FONT_SIZE) {
+      throw new Error('Invalid note font size.');
+    }
     const id = crypto.randomUUID();
     const doc = new Y.Doc();
     this.attachBody(id, doc);
     this.bodies.set(id, doc);
     this.editingNoteId = id;
-    this.metadata.set(id, { id, anchorPage, x, y, lineCount: 1, fontSize: TEXT_FONT_SIZE });
+    this.metadata.set(id, { id, anchorPage, x, y, lineCount: 1, fontSize });
     this.refreshNotes();
     this.refreshVisibleNotes();
     return id;
