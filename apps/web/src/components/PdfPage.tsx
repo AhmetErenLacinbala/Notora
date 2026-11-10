@@ -8,6 +8,7 @@ GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', i
 // Each page document owns its PDF.js worker. The queue bounds concurrent workers,
 // and the document is destroyed as soon as its canvas and text layer are ready.
 const MAX_ACTIVE_PAGES = 2;
+const ZOOM_SETTLE_MS = 180;
 let activePages = 0;
 const waiting: Array<{ signal: AbortSignal; resolve: (release: () => void) => void; reject: (error: Error) => void; onAbort: () => void }> = [];
 
@@ -48,42 +49,113 @@ export interface PdfPageProps {
   version: string;
   accessToken: string;
   zoom: number;
+  active: boolean;
+  retain: boolean;
+  onReady: (pageNumber: number) => void;
   onDestination: (destination: Destination) => void;
 }
 
-export const PdfPage = memo(function PdfPage({ page, documentId, version, accessToken, zoom, onDestination }: PdfPageProps) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+export const PdfPage = memo(function PdfPage({ page, documentId, version, accessToken, zoom, active, retain, onReady, onDestination }: PdfPageProps) {
+  const canvasSlotRef = useRef<HTMLDivElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
+  const renderedRatio = useRef(0);
+  const readyNotified = useRef(false);
+  const linksLoaded = useRef(false);
+  const linksController = useRef<AbortController | null>(null);
+  const onReadyRef = useRef(onReady);
+  onReadyRef.current = onReady;
   const [links, setLinks] = useState<PageLink[]>([]);
   const [state, setState] = useState<'loading' | 'ready' | 'error'>('loading');
   const [retry, setRetry] = useState(0);
+  const [settledZoom, setSettledZoom] = useState(zoom);
 
+  // A changed page identity cannot inherit the previous page's retained DOM.
   useEffect(() => {
-    const controller = new AbortController();
+    renderedRatio.current = 0;
+    readyNotified.current = false;
+    linksLoaded.current = false;
     setLinks([]);
-    getPageLinks(documentId, page.number, accessToken, controller.signal)
-      .then(value => { if (!controller.signal.aborted) setLinks(value); })
-      .catch(() => { if (!controller.signal.aborted) setLinks([]); });
-    return () => controller.abort();
-  }, [documentId, page.number, accessToken]);
+    setState('loading');
+    canvasSlotRef.current?.replaceChildren();
+    textRef.current?.replaceChildren();
+    return () => {
+      linksController.current?.abort();
+      linksController.current = null;
+    };
+  }, [documentId, version, page.number, page.width, page.height, accessToken]);
+
+  // Desktop keeps completed pages mounted. Mobile can clear an inactive page
+  // even if its parent has not yet unmounted it.
+  useEffect(() => {
+    if (active || retain) return;
+    linksController.current?.abort();
+    linksController.current = null;
+    renderedRatio.current = 0;
+    readyNotified.current = false;
+    linksLoaded.current = false;
+    setLinks([]);
+    setState('loading');
+    canvasSlotRef.current?.replaceChildren();
+    textRef.current?.replaceChildren();
+  }, [active, retain]);
 
   useEffect(() => {
+    // A completed desktop page can finish an already-started link request
+    // offscreen; it then needs no new request when the user returns.
+    if (!active && (!retain || !renderedRatio.current)) {
+      linksController.current?.abort();
+      linksController.current = null;
+    }
+  }, [active, retain]);
+
+  useEffect(() => {
+    if (!active || linksLoaded.current || linksController.current) return;
     const controller = new AbortController();
-    const canvas = canvasRef.current;
+    linksController.current = controller;
+    getPageLinks(documentId, page.number, accessToken, controller.signal)
+      .then(value => {
+        if (controller.signal.aborted) return;
+        linksLoaded.current = true;
+        setLinks(value);
+      })
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        linksLoaded.current = true;
+        setLinks([]);
+      })
+      .finally(() => { if (linksController.current === controller) linksController.current = null; });
+  }, [active, documentId, version, page.number, accessToken]);
+
+  useEffect(() => {
+    if (!active || settledZoom === zoom) return;
+    const timer = window.setTimeout(() => setSettledZoom(zoom), ZOOM_SETTLE_MS);
+    return () => window.clearTimeout(timer);
+  }, [active, zoom, settledZoom]);
+
+  useEffect(() => {
+    if (!active || settledZoom !== zoom) return;
+    const pixelLimit = Math.sqrt(10_000_000 / Math.max(1, page.width * page.height));
+    const pixelRatio = Math.max(0.1, Math.min((window.devicePixelRatio || 1) * settledZoom, 2.5, pixelLimit));
+    // A higher-resolution canvas continues to satisfy lower zoom levels.
+    if (renderedRatio.current >= pixelRatio - 0.001) return;
+
+    const controller = new AbortController();
+    const canvasSlot = canvasSlotRef.current;
     const textContainer = textRef.current;
-    if (!canvas || !textContainer) return;
+    if (!canvasSlot || !textContainer) return;
     let release: (() => void) | undefined;
     let loadingTask: ReturnType<typeof getDocument> | undefined;
     let renderTask: ReturnType<Awaited<ReturnType<Awaited<ReturnType<typeof getDocument>['promise']>['getPage']>>['render']> | undefined;
     let textLayer: TextLayer | undefined;
     let cleanupPage: (() => void) | undefined;
     let destroyPromise: Promise<void> | undefined;
+    let stagedCanvas: HTMLCanvasElement | undefined;
+    let committed = false;
     const destroyDocument = () => {
       if (loadingTask && !destroyPromise) destroyPromise = loadingTask.destroy().catch(() => {});
       return destroyPromise;
     };
-    setState('loading');
-    textContainer.replaceChildren();
+    if (!renderedRatio.current) setState('loading');
 
     const render = async () => {
       try {
@@ -108,28 +180,66 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
         cleanupPage = () => pdfPage.cleanup();
         const base = pdfPage.getViewport({ scale: 1 });
         const canonicalScale = page.width / base.width;
-        const textViewport = pdfPage.getViewport({ scale: canonicalScale });
-        textContainer.style.setProperty('--total-scale-factor', String(textViewport.scale * textViewport.userUnit));
-        const pixelLimit = Math.sqrt(10_000_000 / Math.max(1, page.width * page.height));
-        const pixelRatio = Math.max(0.1, Math.min((window.devicePixelRatio || 1) * zoom, 2.5, pixelLimit));
         const imageViewport = pdfPage.getViewport({ scale: canonicalScale * pixelRatio });
-        canvas.width = Math.max(1, Math.ceil(imageViewport.width));
-        canvas.height = Math.max(1, Math.ceil(imageViewport.height));
-        canvas.style.width = `${page.width}px`;
-        canvas.style.height = `${page.height}px`;
-        renderTask = pdfPage.render({ canvas, viewport: imageViewport });
+        stagedCanvas = document.createElement('canvas');
+        stagedCanvas.width = Math.max(1, Math.ceil(imageViewport.width));
+        stagedCanvas.height = Math.max(1, Math.ceil(imageViewport.height));
+        stagedCanvas.className = 'pdf-canvas';
+        renderTask = pdfPage.render({ canvas: stagedCanvas, viewport: imageViewport });
         await renderTask.promise;
+        renderTask = undefined;
         if (controller.signal.aborted) return;
-        textLayer = new TextLayer({ textContentSource: await pdfPage.getTextContent(), container: textContainer, viewport: textViewport });
-        await textLayer.render();
-        if (!controller.signal.aborted) setState('ready');
+
+        // Text uses canonical coordinates. An image upgrade must not disturb
+        // the visible text DOM or a user's current selection.
+        let stagedText: HTMLDivElement | undefined;
+        if (!renderedRatio.current) {
+          const textViewport = pdfPage.getViewport({ scale: canonicalScale });
+          stagedText = document.createElement('div');
+          stagedText.className = textContainer.className;
+          stagedText.style.setProperty('--total-scale-factor', String(textViewport.scale * textViewport.userUnit));
+          textLayer = new TextLayer({ textContentSource: await pdfPage.getTextContent(), container: stagedText, viewport: textViewport });
+          await textLayer.render();
+          textLayer = undefined;
+          if (controller.signal.aborted) return;
+        }
+
+        // Swap only after the replacement has rendered successfully. The DOM
+        // mutations are synchronous, so there is no paint between them.
+        canvasSlot.replaceChildren(stagedCanvas);
+        committed = true;
+        if (stagedText) {
+          textContainer.style.cssText = stagedText.style.cssText;
+          const rotation = stagedText.getAttribute('data-main-rotation');
+          if (rotation) textContainer.setAttribute('data-main-rotation', rotation);
+          else textContainer.removeAttribute('data-main-rotation');
+          const textNodes = document.createDocumentFragment();
+          while (stagedText.firstChild) textNodes.append(stagedText.firstChild);
+          textContainer.replaceChildren(textNodes);
+        }
+        renderedRatio.current = pixelRatio;
+        setState('ready');
+        if (!readyNotified.current) {
+          readyNotified.current = true;
+          onReadyRef.current(page.number);
+        }
       } catch {
-        if (!controller.signal.aborted) setState('error');
+        // A failed upgrade leaves the last completed page visible.
+        if (!controller.signal.aborted && !renderedRatio.current) setState('error');
       } finally {
         try { await destroyDocument(); }
         finally {
           try { cleanupPage?.(); } catch { /* the document may already be destroyed */ }
+          if (!committed && stagedCanvas) { stagedCanvas.width = 0; stagedCanvas.height = 0; }
           release?.();
+          // The mounted page owns only its finished DOM, not PDF.js objects.
+          release = undefined;
+          loadingTask = undefined;
+          renderTask = undefined;
+          textLayer = undefined;
+          cleanupPage = undefined;
+          destroyPromise = undefined;
+          stagedCanvas = undefined;
         }
       }
     };
@@ -139,14 +249,11 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
       renderTask?.cancel();
       textLayer?.cancel();
       void destroyDocument();
-      textContainer.replaceChildren();
-      canvas.width = 0;
-      canvas.height = 0;
     };
-  }, [documentId, version, page.number, page.width, page.height, accessToken, zoom, retry]);
+  }, [active, documentId, version, page.number, page.width, page.height, accessToken, zoom, settledZoom, retry]);
 
   return <div className="pdf-page" data-page={page.number} style={{ left: page.x, top: page.y, width: page.width, height: page.height }}>
-    <canvas className="pdf-canvas" ref={canvasRef} aria-hidden="true" />
+    <div ref={canvasSlotRef} style={{ width: '100%', height: '100%' }} aria-hidden="true" />
     <div className="pdf-text-layer textLayer" ref={textRef} aria-label={`Page ${page.number} text`} />
     <div className="pdf-link-layer" aria-label={`Page ${page.number} links`}>{links.map((link, index) => {
       const [x1, y1, x2, y2] = link.rect;

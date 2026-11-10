@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { Camera, CursorPosition, Destination, DocumentManifest, OutlineItem, PageLayout, Profile, TextNote } from '../../../../packages/shared/src/index';
 import { MAX_NOTE_FONT_SIZE, MIN_NOTE_FONT_SIZE, NOTE_BORDER, NOTE_FONT_STEP, NOTE_PADDING, noteFontSize, noteHeight, noteIntersects, noteLineHeight, pageLayout, PAGE_GAP, STAGE_MARGIN } from '../../../../packages/shared/src/index';
+import { canvasPoint, intersectsRect, selectionRect, wheelPixels, zoomCameraAt } from '../lib/canvasGeometry';
+import type { CanvasPoint, CanvasRect } from '../lib/canvasGeometry';
 import { loadCamera, saveCamera } from '../lib/storage';
 import { WorkspaceSession } from '../lib/workspace';
 import { PdfPage } from './PdfPage';
@@ -64,9 +66,24 @@ interface NoteDrag {
   clientX: number;
   clientY: number;
   zoom: number;
-  origins: Array<{ id: string; x: number; y: number; left: number; top: number }>;
+  origins: Array<{ id: string; x: number; y: number }>;
   dx: number;
   dy: number;
+}
+
+interface MarqueeDrag {
+  pointerId: number;
+  start: CanvasPoint;
+  clientX: number;
+  clientY: number;
+  moved: boolean;
+}
+
+interface PanDrag {
+  pointerId: number;
+  clientX: number;
+  clientY: number;
+  origin: Camera;
 }
 
 export interface WorkspaceProps {
@@ -95,123 +112,199 @@ export function Workspace(props: WorkspaceProps) {
 function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: WorkspaceProps & { session: WorkspaceSession }) {
   const snapshot = useSyncExternalStore(useCallback(listener => session.subscribe(listener), [session]), useCallback(() => session.getSnapshot(), [session]));
   const pages = useMemo(() => pageLayout(manifest.pages), [manifest.pages]);
-  const pageSize = useMemo(() => stageSize(pages), [pages]);
   const size = useMemo(() => contentSize(pages, snapshot.notes), [pages, snapshot.notes]);
   const viewportRef = useRef<HTMLDivElement>(null);
-  const stageRef = useRef<HTMLDivElement>(null);
   const [outlineOpen, setOutlineOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [shareCopied, setShareCopied] = useState(false);
-  const [zoom, setZoom] = useState(1);
-  const [view, setView] = useState({ left: 0, top: 0, width: 0, height: 0 });
+  const [camera, setCameraState] = useState<Camera>({ scrollLeft: 0, scrollTop: 0, zoom: 1 });
+  const cameraRef = useRef(camera);
+  const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
   const [editingId, setEditingId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const selectedIdsRef = useRef(selectedIds);
-  const [cameraReady, setCameraReady] = useState(false);
+  const cameraReady = useRef(false);
   const newNoteIds = useRef(new Set<string>());
   const dragRef = useRef<NoteDrag | null>(null);
+  const marqueeRef = useRef<MarqueeDrag | null>(null);
+  const panRef = useRef<PanDrag | null>(null);
+  const [marquee, setMarquee] = useState<CanvasRect | null>(null);
+  const lastMarqueeEnd = useRef(0);
   const cameraTimer = useRef<number | undefined>(undefined);
-  const scrollFrame = useRef<number | undefined>(undefined);
   const cursorFrame = useRef<number | undefined>(undefined);
   const pendingCursor = useRef<CursorPosition | null>(null);
-  const pendingZoomFocus = useRef<{ x: number; y: number } | null>(null);
-  const latestZoom = useRef(zoom);
-  const latestCameraReady = useRef(cameraReady);
-  latestZoom.current = zoom;
-  latestCameraReady.current = cameraReady;
-
-  const updateView = useCallback(() => {
-    const element = viewportRef.current;
-    if (!element) return;
-    setView({ left: element.scrollLeft, top: element.scrollTop, width: element.clientWidth, height: element.clientHeight });
-  }, []);
+  const lastClientPointer = useRef<CanvasPoint | null>(null);
+  const [desktop, setDesktop] = useState(() => window.matchMedia('(hover: hover) and (pointer: fine)').matches);
+  const desktopRef = useRef(desktop);
+  desktopRef.current = desktop;
+  const [retainedPages, setRetainedPages] = useState<Set<number>>(() => new Set());
 
   const saveCurrentCamera = useCallback(() => {
-    const element = viewportRef.current;
-    if (!element || !cameraReady) return;
+    if (!cameraReady.current) return;
     if (cameraTimer.current) window.clearTimeout(cameraTimer.current);
     cameraTimer.current = window.setTimeout(() => {
-      const camera: Camera = { scrollLeft: element.scrollLeft, scrollTop: element.scrollTop, zoom };
-      void saveCamera(manifest.id, camera);
+      cameraTimer.current = undefined;
+      void saveCamera(manifest.id, cameraRef.current);
     }, 450);
-  }, [cameraReady, zoom, manifest.id]);
+  }, [manifest.id]);
+
+  const queuePointerCursor = useCallback((clientX: number, clientY: number) => {
+    const element = viewportRef.current;
+    if (!element) return;
+    pendingCursor.current = canvasPoint({ x: clientX, y: clientY }, element.getBoundingClientRect(), cameraRef.current);
+    if (!cursorFrame.current) cursorFrame.current = requestAnimationFrame(() => {
+      cursorFrame.current = undefined;
+      session.setCursor(pendingCursor.current);
+    });
+  }, [session]);
+
+  const clearPointerCursor = useCallback(() => {
+    if (cursorFrame.current) { cancelAnimationFrame(cursorFrame.current); cursorFrame.current = undefined; }
+    lastClientPointer.current = null;
+    pendingCursor.current = null;
+    session.setCursor(null);
+  }, [session]);
+
+  const applyCamera = useCallback((next: Camera) => {
+    const current = cameraRef.current;
+    if (current.scrollLeft === next.scrollLeft && current.scrollTop === next.scrollTop && current.zoom === next.zoom) return;
+    cameraRef.current = next;
+    setCameraState(next);
+    saveCurrentCamera();
+    const pointer = lastClientPointer.current;
+    if (pointer) queuePointerCursor(pointer.x, pointer.y);
+  }, [queuePointerCursor, saveCurrentCamera]);
 
   useEffect(() => {
     let live = true;
     void loadCamera(manifest.id).then(camera => {
       if (!live) return;
       const initialZoom = clamp(camera?.zoom ?? 1, MIN_ZOOM, MAX_ZOOM);
-      setZoom(initialZoom);
-      requestAnimationFrame(() => requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
         if (!live || !viewportRef.current) return;
         const element = viewportRef.current;
-        element.scrollLeft = camera?.scrollLeft ?? Math.max(0, (pageSize.width * initialZoom - element.clientWidth) / 2);
-        element.scrollTop = camera?.scrollTop ?? 0;
-        updateView();
-        setCameraReady(true);
-      }));
+        const first = pages[0];
+        const defaultLeft = first ? (first.x + first.width / 2) * initialZoom - element.clientWidth / 2 : 0;
+        const next = {
+          scrollLeft: Number.isFinite(camera?.scrollLeft) ? camera!.scrollLeft : defaultLeft,
+          scrollTop: Number.isFinite(camera?.scrollTop) ? camera!.scrollTop : 0,
+          zoom: initialZoom,
+        };
+        applyCamera(next);
+        cameraReady.current = true;
+      });
     }).catch(() => {
       if (!live) return;
       requestAnimationFrame(() => {
         const element = viewportRef.current;
-        if (element) element.scrollLeft = Math.max(0, (pageSize.width - element.clientWidth) / 2);
-        updateView();
-        setCameraReady(true);
+        if (!live || !element) return;
+        const first = pages[0];
+        const next = { scrollLeft: first ? first.x + first.width / 2 - element.clientWidth / 2 : 0, scrollTop: 0, zoom: 1 };
+        applyCamera(next);
+        cameraReady.current = true;
       });
     });
     return () => { live = false; };
-  }, [manifest.id, pageSize.width, updateView]);
+  }, [manifest.id, pages, applyCamera]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = viewportRef.current;
     if (!element) return;
-    const observer = new ResizeObserver(() => updateView());
+    const updateSize = () => setViewportSize(previous => {
+      const width = element.clientWidth, height = element.clientHeight;
+      return previous.width === width && previous.height === height ? previous : { width, height };
+    });
+    const observer = new ResizeObserver(updateSize);
     observer.observe(element);
-    updateView();
+    updateSize();
     return () => observer.disconnect();
-  }, [updateView]);
+  }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia('(hover: hover) and (pointer: fine)');
+    const onChange = () => setDesktop(media.matches);
+    media.addEventListener('change', onChange);
+    return () => media.removeEventListener('change', onChange);
+  }, []);
+
+  useEffect(() => { setRetainedPages(new Set()); }, [manifest.id, manifest.version]);
+
+  const onPageReady = useCallback((pageNumber: number) => {
+    if (!desktopRef.current) return;
+    setRetainedPages(previous => {
+      if (previous.has(pageNumber)) return previous;
+      const next = new Set(previous);
+      next.add(pageNumber);
+      return next;
+    });
+  }, []);
 
   useEffect(() => () => {
     if (cameraTimer.current) window.clearTimeout(cameraTimer.current);
-    if (scrollFrame.current) cancelAnimationFrame(scrollFrame.current);
     if (cursorFrame.current) cancelAnimationFrame(cursorFrame.current);
-    const element = viewportRef.current;
-    if (element && latestCameraReady.current) void saveCamera(manifest.id, { scrollLeft: element.scrollLeft, scrollTop: element.scrollTop, zoom: latestZoom.current });
+    if (cameraReady.current) void saveCamera(manifest.id, cameraRef.current);
     session.setCursor(null);
   }, [manifest.id, session]);
-
-  const onScroll = () => {
-    if (scrollFrame.current) cancelAnimationFrame(scrollFrame.current);
-    scrollFrame.current = requestAnimationFrame(() => { scrollFrame.current = undefined; updateView(); });
-    saveCurrentCamera();
-  };
 
   const changeZoom = (next: number) => {
     const element = viewportRef.current;
     if (!element) return;
-    const value = clamp(Math.round(next / ZOOM_STEP) * ZOOM_STEP, MIN_ZOOM, MAX_ZOOM);
-    if (value === zoom) return;
-    pendingZoomFocus.current = { x: (element.scrollLeft + element.clientWidth / 2) / zoom, y: (element.scrollTop + element.clientHeight / 2) / zoom };
-    setZoom(value);
+    const value = clamp(next, MIN_ZOOM, MAX_ZOOM);
+    applyCamera(zoomCameraAt(cameraRef.current, { x: element.clientWidth / 2, y: element.clientHeight / 2 }, value));
   };
 
-  useLayoutEffect(() => {
-    const focus = pendingZoomFocus.current;
+  useEffect(() => {
     const element = viewportRef.current;
-    if (!focus || !element) return;
-    pendingZoomFocus.current = null;
-    element.scrollLeft = focus.x * zoom - element.clientWidth / 2;
-    element.scrollTop = focus.y * zoom - element.clientHeight / 2;
-    updateView();
-    saveCurrentCamera();
-  }, [zoom, updateView, saveCurrentCamera]);
+    if (!element) return;
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      session.activity();
+      lastClientPointer.current = { x: event.clientX, y: event.clientY };
+      const current = cameraRef.current;
+      const dx = wheelPixels(event.deltaX, event.deltaMode, element.clientHeight);
+      const dy = wheelPixels(event.deltaY, event.deltaMode, element.clientHeight);
+      if (marqueeRef.current) {
+        const pointerId = marqueeRef.current.pointerId;
+        marqueeRef.current = null;
+        setMarquee(null);
+        selectedIdsRef.current = new Set();
+        setSelectedIds(new Set());
+        if (element.hasPointerCapture(pointerId)) element.releasePointerCapture(pointerId);
+      }
+      if (panRef.current) {
+        const pointerId = panRef.current.pointerId;
+        panRef.current = null;
+        if (element.hasPointerCapture(pointerId)) element.releasePointerCapture(pointerId);
+      }
+      if (event.metaKey || event.ctrlKey) {
+        const nextZoom = clamp(current.zoom * Math.exp(-dy * 0.0015), MIN_ZOOM, MAX_ZOOM);
+        const rect = element.getBoundingClientRect();
+        applyCamera(zoomCameraAt(current, { x: event.clientX - rect.left, y: event.clientY - rect.top }, nextZoom));
+      } else {
+        applyCamera({
+          ...current,
+          scrollLeft: current.scrollLeft + (event.shiftKey && !dx ? dy : dx),
+          scrollTop: current.scrollTop + (event.shiftKey && !dx ? 0 : dy),
+        });
+      }
+    };
+    element.addEventListener('wheel', onWheel, { passive: false });
+    return () => element.removeEventListener('wheel', onWheel);
+  }, [applyCamera, session]);
 
-  const canonicalTop = view.top / zoom;
-  const canonicalBottom = (view.top + view.height) / zoom;
-  const overscan = Math.max(220, (view.height / zoom) * 0.6);
+  const zoom = camera.zoom;
+  const canonicalTop = camera.scrollTop / zoom;
+  const canonicalBottom = (camera.scrollTop + viewportSize.height) / zoom;
+  const canonicalLeft = camera.scrollLeft / zoom;
+  const canonicalRight = (camera.scrollLeft + viewportSize.width) / zoom;
+  const overscan = Math.max(220, (viewportSize.height / zoom) * 0.6);
   const nearbyTop = canonicalTop - overscan;
   const nearbyBottom = canonicalBottom + overscan;
-  const visiblePages = pages.filter(page => page.y <= nearbyBottom && page.y + page.height >= nearbyTop);
+  const nearbyLeft = canonicalLeft - overscan;
+  const nearbyRight = canonicalRight + overscan;
+  const nearbyPages = pages.filter(page => page.y <= nearbyBottom && page.y + page.height >= nearbyTop && page.x <= nearbyRight && page.x + page.width >= nearbyLeft);
+  const nearbyPageNumbers = new Set(nearbyPages.map(page => page.number));
+  const renderedPages = desktop ? pages.filter(page => nearbyPageNumbers.has(page.number) || retainedPages.has(page.number)) : nearbyPages;
   const visibleNotes = snapshot.notes.filter(note => note.text !== null && (noteIntersects(note, pages, nearbyTop, nearbyBottom) || note.id === editingId || note.id === dragRef.current?.anchorId));
 
   const selectIds = (ids: Set<string>) => {
@@ -219,12 +312,86 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
     setSelectedIds(ids);
   };
 
-  const selectNote = (id: string, additive = false) => {
-    if (!additive) { selectIds(new Set([id])); return; }
-    const next = new Set(selectedIdsRef.current);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    selectIds(next);
+  const selectNote = (id: string) => selectIds(new Set([id]));
+
+  const pointerOnCanvas = (clientX: number, clientY: number): CanvasPoint => {
+    const viewport = viewportRef.current;
+    if (!viewport) return { x: 0, y: 0 };
+    return canvasPoint({ x: clientX, y: clientY }, viewport.getBoundingClientRect(), cameraRef.current);
+  };
+
+  const selectWithin = (rect: CanvasRect) => {
+    const ids = new Set<string>();
+    for (const note of snapshot.notes) {
+      if (note.text === null) continue;
+      const page = pages[note.anchorPage - 1];
+      if (!page) continue;
+      if (intersectsRect(rect, {
+        x: page.x + note.x,
+        y: page.y + note.y,
+        width: noteWidth(note.text, noteFontSize(note)) + 2 * (NOTE_PADDING + NOTE_BORDER),
+        height: noteHeight(note),
+      })) ids.add(note.id);
+    }
+    const current = selectedIdsRef.current;
+    if (ids.size !== current.size || [...ids].some(id => !current.has(id))) selectIds(ids);
+  };
+
+  const beginViewportPointer = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button === 1) {
+      event.preventDefault();
+      panRef.current = { pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, origin: cameraRef.current };
+      event.currentTarget.setPointerCapture(event.pointerId);
+      return;
+    }
+    if (event.button !== 0) return;
+    const target = event.target as Element;
+    if (target.closest('.note-item, button, a, input, textarea, [contenteditable]')) return;
+    if (event.pointerType === 'touch') {
+      panRef.current = { pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, origin: cameraRef.current };
+      event.currentTarget.setPointerCapture(event.pointerId);
+      return;
+    }
+    if (target.closest('.pdf-text-layer span, .pdf-text-layer br')) return;
+    event.preventDefault();
+    event.currentTarget.focus({ preventScroll: true });
+    marqueeRef.current = { pointerId: event.pointerId, start: pointerOnCanvas(event.clientX, event.clientY), clientX: event.clientX, clientY: event.clientY, moved: false };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const moveViewportPointer = (event: React.PointerEvent<HTMLDivElement>) => {
+    const pan = panRef.current;
+    if (pan?.pointerId === event.pointerId) {
+      event.preventDefault();
+      applyCamera({ ...cameraRef.current, scrollLeft: pan.origin.scrollLeft - (event.clientX - pan.clientX), scrollTop: pan.origin.scrollTop - (event.clientY - pan.clientY) });
+      return;
+    }
+    const drag = marqueeRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (!drag.moved && Math.hypot(event.clientX - drag.clientX, event.clientY - drag.clientY) < 4) return;
+    event.preventDefault();
+    drag.moved = true;
+    const rect = selectionRect(drag.start, pointerOnCanvas(event.clientX, event.clientY));
+    setMarquee(rect);
+    selectWithin(rect);
+  };
+
+  const endViewportPointer = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (panRef.current?.pointerId === event.pointerId) panRef.current = null;
+    const drag = marqueeRef.current;
+    if (drag?.pointerId === event.pointerId) {
+      if (event.type === 'pointerup') {
+        if (drag.moved) {
+          const rect = selectionRect(drag.start, pointerOnCanvas(event.clientX, event.clientY));
+          selectWithin(rect);
+          lastMarqueeEnd.current = performance.now();
+        } else selectIds(new Set());
+      } else selectIds(new Set());
+      marqueeRef.current = null;
+      setMarquee(null);
+    }
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    if (event.pointerType === 'touch' || event.type === 'pointercancel') clearPointerCursor();
   };
 
   useEffect(() => {
@@ -248,17 +415,11 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
   const beginNoteDrag = (note: TextNote, event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
     const target = event.target as HTMLElement;
-    const additive = event.shiftKey || event.metaKey || event.ctrlKey;
-    if (target.closest('.note-font-controls') || (target.closest('textarea') && !additive)) return;
+    if (target.closest('.note-font-controls, textarea')) return;
     event.preventDefault();
-    if (additive) selectNote(note.id, true);
-    else if (!selectedIdsRef.current.has(note.id)) selectNote(note.id);
+    if (!selectedIdsRef.current.has(note.id)) selectNote(note.id);
     event.currentTarget.focus({ preventScroll: true });
-    if (additive) return;
-    const origins = snapshot.notes.filter(item => selectedIdsRef.current.has(item.id)).map(item => {
-      const page = pages[item.anchorPage - 1];
-      return { id: item.id, x: item.x, y: item.y, left: (page?.x ?? 0) + item.x, top: (page?.y ?? 0) + item.y };
-    });
+    const origins = snapshot.notes.filter(item => selectedIdsRef.current.has(item.id)).map(item => ({ id: item.id, x: item.x, y: item.y }));
     if (!origins.length) return;
     dragRef.current = { pointerId: event.pointerId, anchorId: note.id, clientX: event.clientX, clientY: event.clientY, zoom, origins, dx: 0, dy: 0 };
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -268,10 +429,8 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
     event.preventDefault();
-    const minimumX = Math.max(...drag.origins.map(origin => -origin.left));
-    const minimumY = Math.max(...drag.origins.map(origin => -origin.top));
-    const dx = Math.max(minimumX, (event.clientX - drag.clientX) / drag.zoom);
-    const dy = Math.max(minimumY, (event.clientY - drag.clientY) / drag.zoom);
+    const dx = (event.clientX - drag.clientX) / drag.zoom;
+    const dy = (event.clientY - drag.clientY) / drag.zoom;
     if (dx === drag.dx && dy === drag.dy) return;
     drag.dx = dx;
     drag.dy = dy;
@@ -287,54 +446,51 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
   };
 
   useEffect(() => {
-    if (view.height > 0) session.setVisibleRange(canonicalTop, canonicalBottom);
-  }, [session, canonicalTop, canonicalBottom, view.height]);
+    if (viewportSize.height > 0) session.setVisibleRange(canonicalTop, canonicalBottom);
+  }, [session, canonicalTop, canonicalBottom, viewportSize.height]);
 
   const moveTo = useCallback((destination: Destination) => {
     const element = viewportRef.current;
     const page = pages[destination.page - 1];
     if (!element || !page) return;
-    element.scrollLeft = Math.max(0, (page.x + (destination.x ?? page.width / 2)) * zoom - element.clientWidth / 2);
-    element.scrollTop = Math.max(0, (page.y + (destination.y ?? 0)) * zoom - 72);
-    updateView();
-    saveCurrentCamera();
-  }, [pages, zoom, updateView, saveCurrentCamera]);
+    const current = cameraRef.current;
+    const viewportWorldWidth = element.clientWidth / current.zoom;
+    const destinationX = Number.isFinite(destination.x) ? destination.x! : page.width / 2;
+    const centeredX = page.width <= viewportWorldWidth
+      ? page.width / 2
+      : clamp(destinationX, viewportWorldWidth / 2, page.width - viewportWorldWidth / 2);
+    applyCamera({ ...current,
+      scrollLeft: (page.x + centeredX) * current.zoom - element.clientWidth / 2,
+      scrollTop: (page.y + (destination.y ?? 0)) * current.zoom - 72,
+    });
+  }, [pages, applyCamera]);
 
   const jumpToCursor = (cursor: CursorPosition | null) => {
     const element = viewportRef.current;
     if (!element || !cursor) return;
-    element.scrollLeft = Math.max(0, cursor.x * zoom - element.clientWidth / 2);
-    element.scrollTop = Math.max(0, cursor.y * zoom - element.clientHeight / 2);
-    updateView();
-    saveCurrentCamera();
-  };
-
-  const setPointerCursor = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (!stageRef.current) return;
-    const rect = stageRef.current.getBoundingClientRect();
-    pendingCursor.current = { x: (event.clientX - rect.left) / zoom, y: (event.clientY - rect.top) / zoom };
-    session.activity();
-    if (!cursorFrame.current) cursorFrame.current = requestAnimationFrame(() => {
-      cursorFrame.current = undefined;
-      session.setCursor(pendingCursor.current);
+    const current = cameraRef.current;
+    applyCamera({ ...current,
+      scrollLeft: cursor.x * current.zoom - element.clientWidth / 2,
+      scrollTop: cursor.y * current.zoom - element.clientHeight / 2,
     });
   };
 
-  const clearPointerCursor = () => {
-    if (cursorFrame.current) { cancelAnimationFrame(cursorFrame.current); cursorFrame.current = undefined; }
-    pendingCursor.current = null;
-    session.setCursor(null);
+  const setPointerCursor = (event: React.PointerEvent<HTMLDivElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) {
+      clearPointerCursor();
+      return;
+    }
+    lastClientPointer.current = { x: event.clientX, y: event.clientY };
+    session.activity();
+    queuePointerCursor(event.clientX, event.clientY);
   };
 
   const createAtPointer = (event: React.MouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement;
     if (target.closest('button, a, input, textarea, .pdf-text-layer span, .note-item')) return;
-    if (window.getSelection()?.toString()) return;
-    const stage = stageRef.current;
-    if (!stage) return;
-    const rect = stage.getBoundingClientRect();
-    const x = (event.clientX - rect.left) / zoom;
-    const y = (event.clientY - rect.top) / zoom;
+    if (lastMarqueeEnd.current && performance.now() - lastMarqueeEnd.current < 400) return;
+    const { x, y } = pointerOnCanvas(event.clientX, event.clientY);
     const page = nearestPage(pages, y);
     if (!page) return;
     const id = session.createNote(page.number, x - page.x, y - page.y);
@@ -362,10 +518,7 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
     deleteSelection();
   };
 
-  return <div className="workspace-shell" onPointerDownCapture={event => {
-    session.activity();
-    if (!(event.target as Element).closest('.note-item')) selectIds(new Set());
-  }} onKeyDown={onWorkspaceKeyDown}>
+  return <div className="workspace-shell" onPointerDownCapture={() => session.activity()} onKeyDown={onWorkspaceKeyDown}>
     <header className="workspace-header">
       <div className="workspace-left"><button type="button" className="brand brand-button" onClick={onHome} aria-label="Back to home">notora<span>.</span></button><span className="topbar-separator" /><span className="document-title" title={manifest.title}>{manifest.title}</span></div>
       <div className="workspace-actions">
@@ -378,10 +531,9 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
     </header>
     <div className="workspace-main">
       {outlineOpen && <aside className="outline-panel"><div className="outline-heading"><h2>Outline</h2><button type="button" aria-label="Close outline" onClick={() => setOutlineOpen(false)}>×</button></div>{manifest.outline.length ? <nav aria-label="PDF outline"><OutlineList items={manifest.outline} depth={0} onDestination={moveTo} /></nav> : <p className="outline-empty">No outline in this PDF.</p>}</aside>}
-      <div className="viewer-wrap"><div className="viewer-viewport" ref={viewportRef} onScroll={onScroll} onWheelCapture={() => session.activity()} onPointerMove={setPointerCursor} onPointerLeave={clearPointerCursor} aria-label={`${manifest.title} pages`}>
-        <div className="stage-size" style={{ width: size.width * zoom, height: size.height * zoom }}>
-          <div className="pdf-stage" ref={stageRef} style={{ width: size.width, height: size.height, transform: `scale(${zoom})` }} onDoubleClick={createAtPointer}>
-            {visiblePages.map(page => <PdfPage key={`${manifest.version}:${page.number}:${zoom}`} page={page} documentId={manifest.id} version={manifest.version} accessToken={accessToken} zoom={zoom} onDestination={moveTo} />)}
+      <div className="viewer-wrap"><div className="viewer-viewport" ref={viewportRef} tabIndex={-1} onPointerDown={beginViewportPointer} onPointerEnter={setPointerCursor} onPointerMove={event => { moveViewportPointer(event); setPointerCursor(event); }} onPointerUp={endViewportPointer} onPointerCancel={endViewportPointer} onLostPointerCapture={endViewportPointer} onPointerLeave={clearPointerCursor} onDoubleClick={createAtPointer} onAuxClick={event => { if (event.button === 1) event.preventDefault(); }} aria-label={`${manifest.title} pages`}>
+          <div className="pdf-stage" style={{ width: size.width, height: size.height, transform: `translate(${-camera.scrollLeft}px, ${-camera.scrollTop}px) scale(${zoom})` }}>
+            {renderedPages.map(page => <PdfPage key={`${manifest.version}:${page.number}`} page={page} documentId={manifest.id} version={manifest.version} accessToken={accessToken} zoom={zoom} active={nearbyPageNumbers.has(page.number)} retain={desktop} onReady={onPageReady} onDestination={moveTo} />)}
             <div className="notes-layer" aria-label="Notes">{visibleNotes.map(note => <NoteEditor
               key={note.id}
               note={note}
@@ -400,14 +552,13 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
                 }
               }}
               onFontChange={delta => session.updateNote(note.id, { fontSize: clamp(noteFontSize(note) + delta, MIN_NOTE_FONT_SIZE, MAX_NOTE_FONT_SIZE) })}
-              onKeyboardSelect={additive => selectNote(note.id, additive)}
               onBorderPointerDown={event => beginNoteDrag(note, event)}
               onBorderPointerMove={moveNoteDrag}
               onBorderPointerEnd={endNoteDrag}
             />)}</div>
             <div className="cursors-layer" aria-hidden="true">{snapshot.participants.filter(participant => participant.cursor).map(participant => <div key={participant.clientId} className="remote-cursor" style={{ left: participant.cursor!.x, top: participant.cursor!.y, color: participant.color }}><span className="cursor-pointer" /><span className="cursor-name" style={{ backgroundColor: participant.color }}>{participant.name}</span></div>)}</div>
           </div>
-        </div>
+          {marquee && <div className="selection-marquee" aria-hidden="true" style={{ left: marquee.x * zoom - camera.scrollLeft, top: marquee.y * zoom - camera.scrollTop, width: marquee.width * zoom, height: marquee.height * zoom }} />}
       </div>{snapshot.notes.length === 0 && <div className="viewer-hint">Double-click to add a note</div>}</div>
     </div>
   </div>;
@@ -423,13 +574,12 @@ interface NoteEditorProps {
   onText: (text: string) => void;
   onExit: (text: string) => void;
   onFontChange: (delta: number) => void;
-  onKeyboardSelect: (additive: boolean) => void;
   onBorderPointerDown: (event: React.PointerEvent<HTMLDivElement>) => void;
   onBorderPointerMove: (event: React.PointerEvent<HTMLDivElement>) => void;
   onBorderPointerEnd: (event: React.PointerEvent<HTMLDivElement>) => void;
 }
 
-function NoteEditor({ note, page, selected, editing, onTextFocus, onTextBlur, onText, onExit, onFontChange, onKeyboardSelect, onBorderPointerDown, onBorderPointerMove, onBorderPointerEnd }: NoteEditorProps) {
+function NoteEditor({ note, page, selected, editing, onTextFocus, onTextBlur, onText, onExit, onFontChange, onBorderPointerDown, onBorderPointerMove, onBorderPointerEnd }: NoteEditorProps) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const previousText = useRef(note.text ?? '');
   const localInput = useRef<string | null>(null);
@@ -467,11 +617,6 @@ function NoteEditor({ note, page, selected, editing, onTextFocus, onTextBlur, on
     onPointerUp={onBorderPointerEnd}
     onPointerCancel={onBorderPointerEnd}
     onLostPointerCapture={onBorderPointerEnd}
-    onKeyDown={event => {
-      if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return;
-      event.preventDefault();
-      onKeyboardSelect(event.key === ' ' && event.shiftKey);
-    }}
     onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) onExit(ref.current?.value ?? text); }}
   >
     {selected && <div className={`note-font-controls${page.y + note.y < 35 ? ' near-stage-top' : ''}`} role="group" aria-label="Note font size">

@@ -118,10 +118,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .outline-list button:disabled { color: #a0a19a; }
 
 .viewer-wrap { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; }
-.viewer-viewport { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; background: #f0efeb; }
+.viewer-viewport { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: clip; overscroll-behavior: contain; touch-action: none; background: #f0efeb; }
+.viewer-viewport:focus { outline: none; }
 .viewer-hint { position: absolute; left: 15px; bottom: 15px; z-index: 8; padding: 6px 9px; border-radius: 3px; background: #f9f8f5d9; color: #92948c; font-size: 11px; pointer-events: none; }
-.stage-size { position: relative; margin: 0 auto; }
 .pdf-stage { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+.selection-marquee { position: absolute; z-index: 7; border: 1px solid #a95039; background: #b85d4326; pointer-events: none; }
 .pdf-page { position: absolute; background: #fff; outline: 1px solid #deddd6; box-shadow: 0 2px 9px #24241e19; overflow: hidden; }
 .pdf-canvas { display: block; width: 100%; height: 100%; }
 .pdf-text-layer { position: absolute; inset: 0; z-index: 1; overflow: clip; opacity: 1; line-height: 1; letter-spacing: normal; word-spacing: normal; text-align: initial; color-scheme: only light; forced-color-adjust: none; -webkit-text-size-adjust: none; text-size-adjust: none; transform-origin: 0 0; --scale-round-x: 1px; --scale-round-y: 1px; --min-font-size: 1; --min-font-size-inv: calc(1 / var(--min-font-size)); --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size)); }

@@ -4,7 +4,9 @@ A small shared PDF workspace. Open a PDF, double-click beside a page to write a 
 
 No accounts, drawing tools, or rich-text editor. Notes use plain text and literal newlines. They can extend outside a PDF page and across page boundaries.
 
-Notes have a translucent pink fill and border. Select a note to show its two font-size buttons; drag its border to move it. Shift-click toggles multiple selections. Delete/Backspace removes selected boxes when focus is outside their text; inside a note it edits text normally.
+Notes have a translucent pink fill and border. Select a note to show its two font-size buttons; drag its border to move it. Drag empty space to select multiple boxes, then drag a selected border to move them together. Delete/Backspace removes selected boxes when focus is outside their text; inside a note it edits text normally.
+
+The workspace behaves like a canvas. Scroll or use a trackpad to pan; Command/Ctrl + scroll zooms around the pointer. The zoom buttons use the center of the viewport. No oversized native horizontal scrollbar is needed.
 
 ## Storage
 
@@ -22,7 +24,7 @@ Uploads use sequential, adaptive HTTP chunks (16 KiB–1 MiB) written into one t
 
 The server processes one PDF job at a time using qpdf and pypdf. It derives displayed page geometry (crop, rotation, and user units), outline destinations, and internal links before extracting standalone pages in a single qpdf pass.
 
-The browser reads only requested cached pages, downloads missing pages, and renders a small visible neighborhood. At most two PDF load/render jobs run together; their workers are destroyed after rendering. Offscreen canvases and text layers are removed. All small page-size metadata is available for fast scrolling, while note bodies load by visible vertical intersection. The frontend never reconstructs a 150 MB source document in memory.
+The browser reads only requested cached pages, downloads missing pages, and starts rendering a small visible neighborhood. At most two PDF load/render jobs run together; their workers are destroyed after rendering. On desktop, completed canvases, text layers and links stay in memory for the open document, so returning to a page does not reload it. Memory use therefore grows with the pages visited. Touch/mobile devices still release offscreen pages. Zoom keeps the previous canvas visible until its replacement is ready. All small page-size metadata is available for navigation, while note bodies load by visible vertical intersection. The frontend never reconstructs a 150 MB source document in memory.
 
 ## Development
 
