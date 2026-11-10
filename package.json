@@ -1,0 +1,35 @@
+{
+  "name": "notora",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "PORT=3310 node --import tsx --watch apps/server/src/index.ts",
+    "dev:web": "node scripts/copy-pdf-assets.mjs --dev && vite --config apps/web/vite.config.ts",
+    "build": "vite build --config apps/web/vite.config.ts && node scripts/copy-pdf-assets.mjs",
+    "start": "node --import tsx apps/server/src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fastify/multipart": "10.1.8",
+    "@fastify/static": "10.1.10",
+    "fastify": "5.12.8",
+    "idb": "8.0.4",
+    "pdfjs-dist": "6.5.438",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "tsx": "4.23.15",
+    "ws": "8.22.2",
+    "yjs": "13.6.33"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/ws": "8.18.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.7",
+    "vitest": "5.1.0"
+  }
+}

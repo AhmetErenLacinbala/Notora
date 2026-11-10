@@ -1,0 +1,49 @@
+name: notora
+services:
+  app:
+    image: notora:${NOTORA_VERSION:-local}
+    build:
+      context: .
+      args:
+        REVISION: ${NOTORA_REVISION:-development}
+    restart: unless-stopped
+    init: true
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATA_DIR: /data
+      PUBLIC_ORIGIN: https://notora.lacinbala.com
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-256}
+      MAX_STORAGE_MB: ${MAX_STORAGE_MB:-2048}
+    volumes:
+      - notora-data:/data
+    networks:
+      - web
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 768m
+    cpus: 0.75
+    pids_limit: 96
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: '2'
+    labels:
+      traefik.enable: 'true'
+      traefik.docker.network: apps_web
+      traefik.http.routers.notora.rule: Host(`notora.lacinbala.com`)
+      traefik.http.routers.notora.entrypoints: websecure
+      traefik.http.routers.notora.tls: 'true'
+      traefik.http.routers.notora.tls.certresolver: le
+      traefik.http.services.notora.loadbalancer.server.port: '3000'
+      com.centurylinklabs.watchtower.enable: 'false'
+volumes:
+  notora-data:
+networks:
+  web:
+    name: apps_web
+    external: true

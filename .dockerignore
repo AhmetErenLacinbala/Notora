@@ -1,0 +1,13 @@
+.git
+node_modules
+dist
+apps/web/public/pdf-assets
+data
+work
+outputs
+test-results
+playwright-report
+.env*
+*.log
+.venv
+__pycache__

@@ -1,0 +1,5 @@
+---
+description: Notora scope and shared contracts
+alwaysApply: true
+---
+Read AGENTS.md and docs/contract.md. Keep this application minimal and implement only the user-approved scope. Shared types live in packages/shared/src/index.ts. Respect file ownership; do not independently alter contracts.

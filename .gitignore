@@ -1,0 +1,14 @@
+node_modules/
+dist/
+apps/web/public/pdf-assets/
+data/
+.env
+.env.*
+!.env.example
+work/
+playwright-report/
+test-results/
+*.log
+__pycache__/
+.venv/
+.DS_Store
