@@ -59,18 +59,36 @@ The second fixture is approximately 154 MB. Generated fixtures stay in ignored `
 
 ## Docker deployment
 
-The production Compose file expects the existing external `apps_web` network and Traefik's `le` HTTPS certificate resolver. The `notora.lacinbala.com` A record must point to the VPS. No database service or exposed host port is required.
+GitHub Actions validates every pull request and every `main` push. After the checks pass on `main`, it builds the Linux amd64 image and publishes it to GitHub Container Registry:
+
+- `ghcr.io/ahmeterenlacinbala/notora:latest` for automatic releases.
+- `ghcr.io/ahmeterenlacinbala/notora:sha-<full-commit-sha>` for an exact release or rollback.
+
+The workflow uses the repository's `GITHUB_TOKEN`; it needs no VPS SSH key or long-lived registry publishing secret. The image embeds the full commit SHA in its OCI label and `/healthz` response. Publication is serialized so concurrent pushes cannot overwrite `latest` out of order.
+
+The production Compose file pulls this image; it no longer builds source on the VPS. It expects the existing external `apps_web` network and Traefik's `le` HTTPS certificate resolver. The `notora.lacinbala.com` A record must point to the VPS. No database service or exposed host port is required.
+
+For initial installation, copy `docker-compose.yml` and `.env.example` to `/srv/apps/notora`, then:
 
 ```sh
+cd /srv/apps/notora
 cp .env.example .env
-docker compose build
-docker compose up -d
+docker compose pull app
+docker compose up -d --no-build app
 docker compose ps
 ```
 
-Set `NOTORA_VERSION` and `NOTORA_REVISION` to the release commit when deploying. Defaults cap each upload at 256 MiB and total PDF storage at 2048 MiB; these can be changed in `.env`. Derived page PDFs can be larger in aggregate than the original because shared resources may be repeated. The service has bounded memory/CPU and log rotation.
+For an existing installation, back up `.env`, Compose, and the PDF volume first. Keep existing upload/storage limits, change `NOTORA_VERSION` to `latest`, set `NOTORA_AUTO_UPDATE=true`, and remove the obsolete `NOTORA_REVISION` setting. The revision now comes from the built image. Keep Compose project name `notora` and volume `notora_notora-data` so uploaded PDFs remain available.
 
-`GET /healthz` returns status and the deployed revision. To back up PDFs, back up the `notora-data` volume; that volume does **not** contain browser-local notes. Never use `docker compose down -v` on a deployment whose PDFs should be preserved.
+The VPS's existing Watchtower checks for images every 60 seconds and watches the running Notora container through its enable label. It pulls a changed `latest` image and recreates only that container with its existing volume, network and Traefik configuration. Compose alone does not poll the registry. Future application pushes need no SSH deployment step. Changes to Compose itself still need to be copied to the VPS and applied with `docker compose up -d --no-build app`.
+
+GHCR packages start private. The VPS must be able to pull the package, and Watchtower must have the same registry access. This VPS already mounts `/root/.docker/config.json` into Watchtower at `/config.json:ro`; keep credentials out of the repository and workflow logs. See [GitHub's registry authentication guide](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry) and [Watchtower's registry configuration](https://containrrr.dev/watchtower/private-registries/).
+
+To roll back, edit the VPS `.env` to set `NOTORA_VERSION=sha-<known-good-full-commit-sha>` and `NOTORA_AUTO_UPDATE=false`, then run `docker compose pull app` and `docker compose up -d --no-build app`. To resume automatic releases, restore `NOTORA_VERSION=latest` and `NOTORA_AUTO_UPDATE=true` and run those commands again.
+
+Defaults cap each upload at 256 MiB and total PDF storage at 2048 MiB; these can be changed in `.env`. Derived page PDFs can be larger in aggregate than the original because shared resources may be repeated. The service has bounded memory/CPU and log rotation.
+
+`GET /healthz` returns status and the deployed revision. Verify both the running revision and Docker health after a release. To back up PDFs, back up the `notora_notora-data` volume; that volume does **not** contain browser-local notes. Never use `docker compose down -v` on a deployment whose PDFs should be preserved.
 
 The shared types in `packages/shared/src/index.ts` and [implementation contract](docs/contract.md) define HTTP, WebSocket, note coordinates, and module ownership.
 
