@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
@@ -173,6 +174,30 @@ describe('Notora server', () => {
     const page = await second.app.inject({ method: 'GET', url: `/api/documents/${tokens.documentId}/pages/2.pdf`, headers });
     expect(page.statusCode).toBe(200);
     expect(page.rawPayload.equals(pdf)).toBe(true);
+  });
+
+  it('fingerprints originals only for owners, caches durably, and preserves processing results', async () => {
+    let release!: () => void;
+    const processing = new Promise<void>(resolve => { release = resolve; });
+    const { app, store, dir } = await setup(fakeTools(() => processing));
+    const tokens = await upload(app);
+    const url = `/api/documents/${tokens.documentId}/fingerprint`;
+    const headers = { authorization: `Bearer ${tokens.accessToken}`, 'x-owner-token': tokens.ownerToken };
+    expect((await app.inject({ method: 'GET', url })).statusCode).toBe(401);
+    expect((await app.inject({ method: 'GET', url, headers: { authorization: headers.authorization } })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'GET', url, headers: { ...headers, 'x-owner-token': 'wrong' } })).statusCode).toBe(404);
+    const pending = app.inject({ method: 'GET', url, headers });
+    release();
+    const response = await pending;
+    const expected = { sha256: createHash('sha256').update(pdf).digest('hex'), size: pdf.length };
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(expected);
+    await store.waitForIdle();
+    const saved = JSON.parse(await readFile(join(dir, 'documents', tokens.documentId, 'record.json'), 'utf8'));
+    expect(saved.manifest).toMatchObject({ contentHash: expected.sha256, status: 'ready', pageCount: 2 });
+    // A second request must use metadata rather than read the original again.
+    await rm(join(dir, 'documents', tokens.documentId, 'original.pdf'));
+    expect((await app.inject({ method: 'GET', url, headers })).json()).toEqual(expected);
   });
 
   it('rejects oversized uploads and processes documents one at a time', async () => {

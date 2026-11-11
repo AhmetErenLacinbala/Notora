@@ -1,8 +1,8 @@
 # Notora
 
-A small shared PDF workspace. Open a PDF, double-click beside a page to write a note, and share its link to work together. Clicking a participant jumps to their cursor.
+A small shared PDF workspace. Open a PDF locally, write or draw beside its pages, and choose **Share → Upload this file** when you want to work together. Clicking a participant jumps to their cursor. Shared links open at the sender's page, position and zoom.
 
-No accounts, drawing tools, or rich-text editor. Notes use plain text and literal newlines. They can extend outside a PDF page and across page boundaries.
+No accounts or rich-text editor. Notes use plain text and literal newlines. Notes and drawings can extend outside a PDF page and across page boundaries. The toolbar contains pen, arrow, eraser and text tools; the eraser removes whole strokes/arrows. With no tool selected, click once, then press and drag on the second click to handwrite. A quick double-click without dragging creates a text note.
 
 Notes have a translucent pink fill and border. Select a note to show its two font-size buttons; drag its border to move it. Drag empty space to select multiple boxes, then drag a selected border to move them together. Delete/Backspace removes selected boxes when focus is outside their text; inside a note it edits text normally.
 
@@ -10,21 +10,23 @@ The workspace behaves like a canvas. Scroll or use a trackpad to pan; Command/Ct
 
 ## Storage
 
-- **Server:** original PDF, individual page PDFs, page sizes, navigation metadata, and hashed access tokens. Docker stores these in the `notora-data` volume.
-- **Browser:** display name, creator-only recent documents, camera position, requested PDF page cache, and Yjs note state in IndexedDB. Opening a shared link never adds it to the guest's recent list.
-- **Live session:** note updates and cursor positions travel through WebSocket. The server holds shared note state only in memory and releases it when the last participant leaves.
+- **Server (after explicit upload):** original PDF, individual page PDFs, page sizes, navigation metadata, and hashed access tokens. Docker stores these in the `notora-data` volume.
+- **Browser:** local PDF Blobs, display name, creator-only recent documents, camera position, requested PDF page cache, and Yjs note/drawing state in IndexedDB. Opening a shared link never adds it to the guest's recent list. Local PDF metadata is stored separately from its Blob, so listing history does not load the files. SHA-256 content identity reuses an earlier local/shared session even if the filename changes.
+- **Live session:** text, final drawing updates, transient stroke previews and cursor positions travel through WebSocket. The server holds shared annotation state only in memory and releases it when the last participant leaves.
 
-Editing is immediate. Note persistence waits for **10 seconds without input**; hiding or closing the workspace attempts an earlier flush. Continuous input can postpone saving. A crash before a successful flush can lose unsaved changes.
+Editing is immediate. Annotation persistence waits for **10 seconds without input**; hiding or closing the workspace attempts an earlier flush. Continuous input can postpone saving. A crash before a successful flush can lose unsaved changes. Freehand samples are fitted to piecewise cubic Bézier curves on release using least squares, bounded refinement and recursive error splitting. Final geometry is stored as compact float32 bytes; in-progress samples are transient and never saved as a second copy.
 
-PDFs remain available when the creator is offline, but notes can only be restored from a browser that has saved them. Clearing that browser's site data removes its notes and creator history. An access link grants reading and editing to anyone holding it; names do not establish ownership. The owner's additional token stays in their browser.
+Uploaded PDFs remain available when the creator is offline, but annotations can only be restored from a browser that has saved them. Clearing that browser's site data removes its local PDFs, annotations and creator history. An access link grants reading and editing to anyone holding it; names do not establish ownership. The owner's additional token stays in their browser.
 
 ## Large PDFs
+
+Opening a file does not upload it. The local PDF reader supplies bounded Blob ranges to one PDF.js document/worker, reads page dimensions without rasterizing every page, and renders only nearby pages. Content hashing also uses bounded Blob slices. Opening Share alone still sends no PDF bytes; uploading starts only after its explicit button is pressed.
 
 Uploads use sequential, adaptive HTTP chunks (16 KiB–1 MiB) written into one temporary file. Each request stays short enough for the shared proxy, with bounded retries and an offset check after interrupted requests. No full-file browser buffer or permanent chunk files are created. Incomplete upload sessions expire after 30 idle minutes; a server restart requires restarting an unfinished upload.
 
 The server processes one PDF job at a time using qpdf and pypdf. It derives displayed page geometry (crop, rotation, and user units), outline destinations, and internal links before extracting standalone pages in a single qpdf pass.
 
-The browser reads only requested cached pages, downloads missing pages, and starts rendering a small visible neighborhood. At most two PDF load/render jobs run together; their workers are destroyed after rendering. On desktop, completed canvases, text layers and links stay in memory for the open document, so returning to a page does not reload it. Memory use therefore grows with the pages visited. Touch/mobile devices still release offscreen pages. Zoom keeps the previous canvas visible until its replacement is ready. All small page-size metadata is available for navigation, while note bodies load by visible vertical intersection. The frontend never reconstructs a 150 MB source document in memory.
+The browser reads only requested cached pages, downloads missing pages, and starts rendering a small visible neighborhood. At most two PDF load/render jobs run together; remote page workers are destroyed after rendering. On desktop, completed canvases, text layers and links stay in memory for the open document, so returning to a page does not reload it. Memory use therefore grows with the pages visited. Touch/mobile devices still release offscreen pages. Zoom keeps the previous canvas visible until its replacement is ready. All small page-size metadata is available for navigation, while note and drawing bodies load by visible vertical intersection. The frontend never reconstructs a 150 MB source document in memory.
 
 ## Development
 
@@ -74,4 +76,4 @@ The shared types in `packages/shared/src/index.ts` and [implementation contract]
 
 ## Stack
 
-React + TypeScript + Vite, PDF.js, IndexedDB (`idb`), Yjs, Fastify, WebSocket (`ws`), qpdf, and pypdf. One Node process serves the API, WebSocket, and built frontend from a single container.
+React + TypeScript + Vite, PDF.js, IndexedDB (`idb`), incremental SHA-256 (`@noble/hashes`), Yjs, Fastify, WebSocket (`ws`), qpdf, and pypdf. One Node process serves the API, WebSocket, and built frontend from a single container.

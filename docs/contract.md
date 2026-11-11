@@ -1,5 +1,7 @@
 # Notora implementation contract (v1)
 
+The later [drawing and local-first contract](drawing-local-contract.md) supersedes upload-on-open and no-drawing restrictions below. Existing text/camera formats remain compatible.
+
 ## Scope and deployment
 One TypeScript monorepo, one long-running Node/Fastify process in one Docker container, existing VPS Traefik provides HTTPS. Root owns deploy/config; no subagent deploys. English minimal UI. Original PDF and derived pages live under DATA_DIR (persistent volume). Notes are NEVER stored on server disk; shared editing is ephemeral while clients are connected. Creator-owned history is only in browser storage, independent of display name and guest caches.
 

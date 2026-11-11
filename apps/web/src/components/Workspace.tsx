@@ -1,10 +1,16 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import type { Camera, CursorPosition, Destination, DocumentManifest, OutlineItem, PageLayout, Profile, TextNote } from '../../../../packages/shared/src/index';
+import type { Camera, CubicBezier, CursorPosition, Destination, DocumentManifest, DrawingShape, OutlineItem, PageLayout, Profile, TextNote } from '../../../../packages/shared/src/index';
 import { MAX_NOTE_FONT_SIZE, MIN_NOTE_FONT_SIZE, NOTE_BORDER, NOTE_FONT_STEP, NOTE_PADDING, TEXT_FONT_SIZE, noteFontSize, noteHeight, noteIntersects, noteLineHeight, pageLayout, PAGE_GAP, STAGE_MARGIN } from '../../../../packages/shared/src/index';
 import { canvasPoint, intersectsRect, selectionRect, wheelPixels, zoomCameraAt } from '../lib/canvasGeometry';
 import type { CanvasPoint, CanvasRect } from '../lib/canvasGeometry';
+import { drawingBounds, fitStroke, hitDrawing } from '../lib/drawingGeometry';
+import type { LocalPdfSource } from '../lib/localPdf';
+import { buildShareUrl } from '../lib/shareLink';
+import type { SharedView } from '../lib/shareLink';
 import { loadCamera, saveCamera } from '../lib/storage';
 import { WorkspaceSession } from '../lib/workspace';
+import { DrawingLayer } from './DrawingLayer';
+import type { DrawingLayerHandle } from './DrawingLayer';
 import { PdfPage } from './PdfPage';
 
 const MIN_ZOOM = 0.5;
@@ -22,6 +28,7 @@ function noteWidth(text: string, fontSize: number): number {
 }
 
 function clamp(value: number, min: number, max: number) { return Math.min(max, Math.max(min, value)); }
+function validViewCoordinate(value: number | undefined): value is number { return typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= 10_000_000; }
 
 function stageSize(pages: PageLayout[]) {
   const maxWidth = pages.reduce((max, page) => Math.max(max, page.width), 0);
@@ -84,7 +91,32 @@ interface PanDrag {
   clientX: number;
   clientY: number;
   origin: Camera;
+  moved: boolean;
 }
+
+type Tool = 'pen' | 'arrow' | 'eraser' | 'text' | null;
+
+interface ActiveDrawing {
+  pointerId: number;
+  id: string;
+  kind: 'stroke' | 'arrow';
+  anchorPage: number;
+  x: number;
+  y: number;
+  points: CursorPosition[];
+  stagePoints: CursorPosition[];
+  nextPreviewPoint: number;
+  previewSeq: number;
+  lastPreviewAt: number;
+  minSampleDistance: number;
+  previewResetPending: boolean;
+  gesture: boolean;
+  moved: boolean;
+}
+
+interface PressCandidate { at: number; x: number; y: number; pointerType: string }
+
+interface PinchGesture { ids: [number, number]; worldX: number; worldY: number; distance: number; zoom: number }
 
 export interface WorkspaceProps {
   manifest: DocumentManifest;
@@ -92,24 +124,33 @@ export interface WorkspaceProps {
   ownerToken?: string;
   profile: Profile;
   onHome: () => void;
+  storageId?: string;
+  localOnly?: boolean;
+  localPdf?: LocalPdfSource;
+  onUpload?: (beforeTransition?: () => Promise<void>) => Promise<void>;
+  uploadState?: { status: 'uploading' | 'processing'; progress: number } | null;
+  uploadError?: string;
+  initialView?: SharedView;
 }
 
 export function Workspace(props: WorkspaceProps) {
-  const [session, setSession] = useState<WorkspaceSession | null>(null);
+  const identity = JSON.stringify([props.manifest.id, props.manifest.version, props.accessToken,
+    props.ownerToken, props.profile.id, props.storageId, props.localOnly]);
+  const [slot, setSlot] = useState<{ identity: string; session: WorkspaceSession } | null>(null);
   useEffect(() => {
-    const active = new WorkspaceSession({ manifest: props.manifest, accessToken: props.accessToken, ownerToken: props.ownerToken, profile: props.profile });
-    setSession(active);
+    const active = new WorkspaceSession({ manifest: props.manifest, accessToken: props.accessToken, ownerToken: props.ownerToken, profile: props.profile, storageId: props.storageId, localOnly: props.localOnly });
+    setSlot({ identity, session: active });
     active.connect();
     return () => {
-      setSession(current => current === active ? null : current);
+      setSlot(current => current?.session === active ? null : current);
       void active.destroy();
     };
-  }, [props.manifest.id, props.manifest.version, props.accessToken, props.ownerToken, props.profile.id]);
-  if (!session) return <div className="workspace-init" role="status">Opening workspace…</div>;
-  return <WorkspaceContent {...props} session={session} />;
+  }, [identity]);
+  if (!slot || slot.identity !== identity) return <div className="workspace-init" role="status">Opening workspace…</div>;
+  return <WorkspaceContent key={identity} {...props} session={slot.session} />;
 }
 
-function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: WorkspaceProps & { session: WorkspaceSession }) {
+function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly, localPdf, onUpload, uploadState, uploadError, initialView, session }: WorkspaceProps & { session: WorkspaceSession }) {
   const snapshot = useSyncExternalStore(useCallback(listener => session.subscribe(listener), [session]), useCallback(() => session.getSnapshot(), [session]));
   const pages = useMemo(() => pageLayout(manifest.pages), [manifest.pages]);
   const size = useMemo(() => contentSize(pages, snapshot.notes), [pages, snapshot.notes]);
@@ -117,6 +158,9 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
   const [outlineOpen, setOutlineOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [shareCopied, setShareCopied] = useState(false);
+  const [shareBusy, setShareBusy] = useState(false);
+  const [shareActionError, setShareActionError] = useState<string | null>(null);
+  const [tool, setTool] = useState<Tool>(null);
   const [camera, setCameraState] = useState<Camera>({ scrollLeft: 0, scrollTop: 0, zoom: 1 });
   const cameraRef = useRef(camera);
   const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
@@ -129,6 +173,15 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
   const dragRef = useRef<NoteDrag | null>(null);
   const marqueeRef = useRef<MarqueeDrag | null>(null);
   const panRef = useRef<PanDrag | null>(null);
+  const drawingLayerRef = useRef<DrawingLayerHandle>(null);
+  const activeDrawing = useRef<ActiveDrawing | null>(null);
+  const eraserPointer = useRef<number | null>(null);
+  const erasedIds = useRef(new Set<string>());
+  const pressCandidate = useRef<PressCandidate | null>(null);
+  const suppressDoubleClickUntil = useRef(0);
+  const touches = useRef(new Map<number, CanvasPoint>());
+  const pinchRef = useRef<PinchGesture | null>(null);
+  const touchGesture = useRef(false);
   const [marquee, setMarquee] = useState<CanvasRect | null>(null);
   const lastMarqueeEnd = useRef(0);
   const cameraTimer = useRef<number | undefined>(undefined);
@@ -139,15 +192,18 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
   const desktopRef = useRef(desktop);
   desktopRef.current = desktop;
   const [retainedPages, setRetainedPages] = useState<Set<number>>(() => new Set());
+  const drawingsRef = useRef<DrawingShape[]>(snapshot.drawings);
+  drawingsRef.current = snapshot.drawings;
+  const cameraStorageId = storageId ?? manifest.id;
 
   const saveCurrentCamera = useCallback(() => {
     if (!cameraReady.current) return;
     if (cameraTimer.current) window.clearTimeout(cameraTimer.current);
     cameraTimer.current = window.setTimeout(() => {
       cameraTimer.current = undefined;
-      void saveCamera(manifest.id, cameraRef.current);
+      void saveCamera(cameraStorageId, cameraRef.current);
     }, 450);
-  }, [manifest.id]);
+  }, [cameraStorageId]);
 
   const queuePointerCursor = useCallback((clientX: number, clientY: number) => {
     const element = viewportRef.current;
@@ -178,19 +234,30 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
 
   useEffect(() => {
     let live = true;
-    void loadCamera(manifest.id).then(camera => {
+    void loadCamera(cameraStorageId).then(camera => {
       if (!live) return;
-      const initialZoom = clamp(camera?.zoom ?? 1, MIN_ZOOM, MAX_ZOOM);
+      const requestedZoom = Number.isFinite(initialView?.zoom) ? initialView!.zoom! : camera?.zoom ?? 1;
+      const initialZoom = clamp(requestedZoom, MIN_ZOOM, MAX_ZOOM);
       requestAnimationFrame(() => {
         if (!live || !viewportRef.current) return;
         const element = viewportRef.current;
         const first = pages[0];
         const defaultLeft = first ? (first.x + first.width / 2) * initialZoom - element.clientWidth / 2 : 0;
-        const next = {
+        let next = {
           scrollLeft: Number.isFinite(camera?.scrollLeft) ? camera!.scrollLeft : defaultLeft,
           scrollTop: Number.isFinite(camera?.scrollTop) ? camera!.scrollTop : 0,
           zoom: initialZoom,
         };
+        const viewPage = initialView && Number.isSafeInteger(initialView.page) ? pages[initialView.page - 1] : undefined;
+        if (viewPage) {
+          const centerX = validViewCoordinate(initialView?.x) ? initialView!.x! : viewPage.width / 2;
+          const centerY = validViewCoordinate(initialView?.y) ? initialView!.y! : element.clientHeight / (2 * initialZoom);
+          next = {
+            scrollLeft: (viewPage.x + centerX) * initialZoom - element.clientWidth / 2,
+            scrollTop: (viewPage.y + centerY) * initialZoom - element.clientHeight / 2,
+            zoom: initialZoom,
+          };
+        }
         applyCamera(next);
         cameraReady.current = true;
       });
@@ -200,13 +267,19 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
         const element = viewportRef.current;
         if (!live || !element) return;
         const first = pages[0];
-        const next = { scrollLeft: first ? first.x + first.width / 2 - element.clientWidth / 2 : 0, scrollTop: 0, zoom: 1 };
+        const fallbackZoom = clamp(Number.isFinite(initialView?.zoom) ? initialView!.zoom! : 1, MIN_ZOOM, MAX_ZOOM);
+        const viewPage = initialView && Number.isSafeInteger(initialView.page) ? pages[initialView.page - 1] : undefined;
+        const next = viewPage ? {
+          scrollLeft: (viewPage.x + (validViewCoordinate(initialView?.x) ? initialView!.x! : viewPage.width / 2)) * fallbackZoom - element.clientWidth / 2,
+          scrollTop: (viewPage.y + (validViewCoordinate(initialView?.y) ? initialView!.y! : element.clientHeight / (2 * fallbackZoom))) * fallbackZoom - element.clientHeight / 2,
+          zoom: fallbackZoom,
+        } : { scrollLeft: first ? (first.x + first.width / 2) * fallbackZoom - element.clientWidth / 2 : 0, scrollTop: 0, zoom: fallbackZoom };
         applyCamera(next);
         cameraReady.current = true;
       });
     });
     return () => { live = false; };
-  }, [manifest.id, pages, applyCamera]);
+  }, [cameraStorageId, pages, applyCamera, initialView?.page, initialView?.x, initialView?.y, initialView?.zoom]);
 
   useLayoutEffect(() => {
     const element = viewportRef.current;
@@ -243,9 +316,10 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
   useEffect(() => () => {
     if (cameraTimer.current) window.clearTimeout(cameraTimer.current);
     if (cursorFrame.current) cancelAnimationFrame(cursorFrame.current);
-    if (cameraReady.current) void saveCamera(manifest.id, cameraRef.current);
+    if (cameraReady.current) void saveCamera(cameraStorageId, cameraRef.current);
+    if (activeDrawing.current) session.sendDrawingPreview(null);
     session.setCursor(null);
-  }, [manifest.id, session]);
+  }, [cameraStorageId, session]);
 
   const changeZoom = (next: number) => {
     const element = viewportRef.current;
@@ -260,6 +334,13 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
       session.activity();
+      pressCandidate.current = null;
+      if (activeDrawing.current) {
+        activeDrawing.current = null;
+        drawingLayerRef.current?.clearActive();
+        session.sendDrawingPreview(null);
+      }
+      eraserPointer.current = null;
       lastClientPointer.current = { x: event.clientX, y: event.clientY };
       const current = cameraRef.current;
       const dx = wheelPixels(event.deltaX, event.deltaMode, element.clientHeight);
@@ -321,6 +402,203 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
     return canvasPoint({ x: clientX, y: clientY }, viewport.getBoundingClientRect(), cameraRef.current);
   };
 
+  const createNoteAt = (clientX: number, clientY: number) => {
+    const { x, y } = pointerOnCanvas(clientX, clientY);
+    const page = nearestPage(pages, y);
+    if (!page) return;
+    const id = session.createNote(page.number, x - page.x, y - page.y, nextNoteFontSize);
+    newNoteIds.current.add(id);
+    selectNote(id);
+    setEditingId(id);
+    session.setEditingNote(id);
+    session.activity();
+  };
+
+  const clearDrawing = () => {
+    if (!activeDrawing.current) return;
+    activeDrawing.current = null;
+    drawingLayerRef.current?.clearActive();
+    session.sendDrawingPreview(null);
+  };
+
+  const beginDrawing = (event: React.PointerEvent<HTMLDivElement>, kind: 'stroke' | 'arrow', gesture: boolean) => {
+    const stage = pointerOnCanvas(event.clientX, event.clientY);
+    const page = nearestPage(pages, stage.y);
+    if (!page) return;
+    event.preventDefault();
+    event.currentTarget.focus({ preventScroll: true });
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const active: ActiveDrawing = {
+      pointerId: event.pointerId, id: crypto.randomUUID(), kind,
+      anchorPage: page.number, x: stage.x - page.x, y: stage.y - page.y,
+      points: [{ x: 0, y: 0 }], stagePoints: [stage],
+      nextPreviewPoint: 1, previewSeq: 1, lastPreviewAt: performance.now(),
+      minSampleDistance: 0.15 / cameraRef.current.zoom, previewResetPending: false,
+      gesture, moved: false,
+    };
+    activeDrawing.current = active;
+    drawingLayerRef.current?.updateActive(kind, active.stagePoints);
+    session.sendDrawingPreview({
+      id: active.id, kind, anchorPage: active.anchorPage, x: active.x, y: active.y,
+      width: 2, seq: 0, points: [{ x: 0, y: 0 }],
+    });
+  };
+
+  const restartPreview = (drawing: ActiveDrawing) => {
+    const last = drawing.points.length - 1;
+    const step = Math.max(1, Math.ceil(drawing.points.length / 255));
+    const points = drawing.points.filter((_, index) => index % step === 0 || index === last);
+    session.sendDrawingPreview({
+      id: drawing.id, kind: drawing.kind, anchorPage: drawing.anchorPage, x: drawing.x, y: drawing.y,
+      width: 2, seq: 0, points: points.slice(0, 256),
+    });
+    drawing.previewSeq = 1;
+    drawing.nextPreviewPoint = drawing.points.length;
+    drawing.previewResetPending = false;
+    drawing.lastPreviewAt = performance.now();
+  };
+
+  const sendPreviewPoints = (drawing: ActiveDrawing) => {
+    const elapsed = performance.now() - drawing.lastPreviewAt;
+    if (elapsed < 40) return;
+    if (drawing.previewResetPending || elapsed > 7_000) {
+      restartPreview(drawing);
+      return;
+    }
+    if (drawing.nextPreviewPoint >= drawing.points.length) return;
+    const points = drawing.points.slice(drawing.nextPreviewPoint, drawing.nextPreviewPoint + 256);
+    drawing.nextPreviewPoint += points.length;
+    drawing.lastPreviewAt = performance.now();
+    session.sendDrawingPreview({
+      id: drawing.id, kind: drawing.kind, anchorPage: drawing.anchorPage, x: drawing.x, y: drawing.y,
+      width: 2, seq: drawing.previewSeq++, points,
+    });
+  };
+
+  const decimateDrawing = (drawing: ActiveDrawing) => {
+    const last = drawing.points.length - 1;
+    drawing.points = drawing.points.filter((_, index) => index % 2 === 0 || index === last);
+    drawing.stagePoints = drawing.stagePoints.filter((_, index) => index % 2 === 0 || index === last);
+    drawing.minSampleDistance *= 2;
+    drawing.previewResetPending = true;
+    drawing.nextPreviewPoint = drawing.points.length;
+  };
+
+  const sampleDrawing = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drawing = activeDrawing.current;
+    if (!drawing || drawing.pointerId !== event.pointerId) return;
+    const native = event.nativeEvent;
+    const samples = native.getCoalescedEvents?.() ?? [native];
+    for (const sample of samples.length ? samples : [native]) {
+      const stage = pointerOnCanvas(sample.clientX, sample.clientY);
+      const previous = drawing.stagePoints[drawing.stagePoints.length - 1];
+      if (Math.hypot(stage.x - previous.x, stage.y - previous.y) < drawing.minSampleDistance) continue;
+      if (drawing.points.length >= 4096) decimateDrawing(drawing);
+      drawing.stagePoints.push(stage);
+      drawing.points.push({ x: stage.x - drawing.stagePoints[0].x, y: stage.y - drawing.stagePoints[0].y });
+      if (Math.hypot(stage.x - drawing.stagePoints[0].x, stage.y - drawing.stagePoints[0].y) >= 2 / cameraRef.current.zoom) {
+        drawing.moved = true;
+        if (drawing.gesture) suppressDoubleClickUntil.current = performance.now() + 700;
+      }
+    }
+    drawingLayerRef.current?.updateActive(drawing.kind, drawing.stagePoints);
+    sendPreviewPoints(drawing);
+    session.activity();
+  };
+
+  const finishDrawing = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drawing = activeDrawing.current;
+    if (!drawing || drawing.pointerId !== event.pointerId) return;
+    if (event.type === 'pointerup') sampleDrawing(event);
+    try {
+      if (event.type !== 'pointerup') return;
+      if (drawing.gesture && !drawing.moved) {
+        suppressDoubleClickUntil.current = performance.now() + 700;
+        createNoteAt(event.clientX, event.clientY);
+        return;
+      }
+      if (drawing.kind === 'arrow' && !drawing.moved) return;
+      const curves: CubicBezier[] = drawing.kind === 'arrow'
+        ? (() => {
+          const end = drawing.points[drawing.points.length - 1];
+          return [[0, 0, end.x / 3, end.y / 3, end.x * 2 / 3, end.y * 2 / 3, end.x, end.y]] as CubicBezier[];
+        })()
+        : fitStroke(drawing.points, 0.75 / cameraRef.current.zoom);
+      if (!curves.length) return;
+      session.createDrawing({
+        kind: drawing.kind, anchorPage: drawing.anchorPage, x: drawing.x, y: drawing.y,
+        width: 2, bounds: drawingBounds(curves, 2, drawing.kind),
+      }, curves, drawing.id);
+      session.activity();
+    } finally {
+      clearDrawing();
+    }
+  };
+
+  const eraseAt = (clientX: number, clientY: number) => {
+    const stage = pointerOnCanvas(clientX, clientY);
+    const radius = 6 / cameraRef.current.zoom;
+    const hits: string[] = [];
+    for (const drawing of drawingsRef.current) {
+      if (!drawing.curves || erasedIds.current.has(drawing.id)) continue;
+      const page = pages[drawing.anchorPage - 1];
+      if (!page) continue;
+      const local = { x: stage.x - page.x - drawing.x, y: stage.y - page.y - drawing.y };
+      if (local.x < drawing.bounds.minX - radius || local.x > drawing.bounds.maxX + radius ||
+          local.y < drawing.bounds.minY - radius || local.y > drawing.bounds.maxY + radius) continue;
+      if (hitDrawing(drawing.curves, local, radius, drawing.kind, drawing.width)) {
+        erasedIds.current.add(drawing.id);
+        hits.push(drawing.id);
+      }
+    }
+    if (hits.length) { session.deleteDrawings(hits); session.activity(); }
+  };
+
+  const startPinch = () => {
+    const entries = [...touches.current.entries()];
+    if (entries.length < 2) return;
+    clearDrawing();
+    eraserPointer.current = null;
+    pressCandidate.current = null;
+    touchGesture.current = true;
+    marqueeRef.current = null;
+    setMarquee(null);
+    panRef.current = null;
+    dragRef.current = null;
+    const [[firstId, first], [secondId, second]] = entries;
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const rect = viewport.getBoundingClientRect();
+    const middleX = (first.x + second.x) / 2 - rect.left;
+    const middleY = (first.y + second.y) / 2 - rect.top;
+    const current = cameraRef.current;
+    pinchRef.current = {
+      ids: [firstId, secondId],
+      worldX: (middleX + current.scrollLeft) / current.zoom,
+      worldY: (middleY + current.scrollTop) / current.zoom,
+      distance: Math.max(1, Math.hypot(first.x - second.x, first.y - second.y)),
+      zoom: current.zoom,
+    };
+  };
+
+  const movePinch = () => {
+    const pinch = pinchRef.current;
+    const viewport = viewportRef.current;
+    if (!pinch || !viewport) return;
+    const first = touches.current.get(pinch.ids[0]);
+    const second = touches.current.get(pinch.ids[1]);
+    if (!first || !second) return;
+    const rect = viewport.getBoundingClientRect();
+    const middleX = (first.x + second.x) / 2 - rect.left;
+    const middleY = (first.y + second.y) / 2 - rect.top;
+    const zoom = clamp(pinch.zoom * Math.hypot(first.x - second.x, first.y - second.y) / pinch.distance, MIN_ZOOM, MAX_ZOOM);
+    applyCamera({
+      scrollLeft: pinch.worldX * zoom - middleX,
+      scrollTop: pinch.worldY * zoom - middleY,
+      zoom,
+    });
+  };
+
   const selectWithin = (rect: CanvasRect) => {
     const ids = new Set<string>();
     for (const note of snapshot.notes) {
@@ -339,21 +617,65 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
   };
 
   const beginViewportPointer = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === 'touch') {
+      touches.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      if (touches.current.size >= 2) {
+        event.preventDefault();
+        event.currentTarget.setPointerCapture(event.pointerId);
+        startPinch();
+        return;
+      }
+      touchGesture.current = false;
+    }
     if (event.button === 1) {
       event.preventDefault();
-      panRef.current = { pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, origin: cameraRef.current };
+      panRef.current = { pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, origin: cameraRef.current, moved: false };
       event.currentTarget.setPointerCapture(event.pointerId);
       return;
     }
     if (event.button !== 0) return;
+    if (tool === 'pen' || tool === 'arrow') {
+      pressCandidate.current = null;
+      beginDrawing(event, tool === 'pen' ? 'stroke' : 'arrow', false);
+      return;
+    }
+    if (tool === 'eraser') {
+      event.preventDefault();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      eraserPointer.current = event.pointerId;
+      erasedIds.current.clear();
+      eraseAt(event.clientX, event.clientY);
+      return;
+    }
+    if (tool === 'text') {
+      event.preventDefault();
+      suppressDoubleClickUntil.current = performance.now() + 700;
+      createNoteAt(event.clientX, event.clientY);
+      setTool(null);
+      return;
+    }
     const target = event.target as Element;
-    if (target.closest('.note-item, button, a, input, textarea, [contenteditable]')) return;
+    if (target.closest('.note-item, button, a, input, textarea, [contenteditable], .pdf-text-layer span, .pdf-text-layer br') && event.pointerType !== 'touch') {
+      pressCandidate.current = null;
+      return;
+    }
+    if (target.closest('.note-item, button, a, input, textarea, [contenteditable]')) {
+      pressCandidate.current = null;
+      return;
+    }
+    const candidate = pressCandidate.current;
+    if (candidate && candidate.pointerType === event.pointerType && performance.now() - candidate.at <= 420 &&
+        Math.hypot(event.clientX - candidate.x, event.clientY - candidate.y) <= 18) {
+      pressCandidate.current = null;
+      beginDrawing(event, 'stroke', true);
+      return;
+    }
+    pressCandidate.current = null;
     if (event.pointerType === 'touch') {
-      panRef.current = { pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, origin: cameraRef.current };
+      panRef.current = { pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, origin: cameraRef.current, moved: false };
       event.currentTarget.setPointerCapture(event.pointerId);
       return;
     }
-    if (target.closest('.pdf-text-layer span, .pdf-text-layer br')) return;
     event.preventDefault();
     event.currentTarget.focus({ preventScroll: true });
     marqueeRef.current = { pointerId: event.pointerId, start: pointerOnCanvas(event.clientX, event.clientY), clientX: event.clientX, clientY: event.clientY, moved: false };
@@ -361,9 +683,25 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
   };
 
   const moveViewportPointer = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === 'touch' && touches.current.has(event.pointerId)) {
+      touches.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      if (pinchRef.current) { event.preventDefault(); movePinch(); return; }
+    }
+    if (activeDrawing.current?.pointerId === event.pointerId) {
+      event.preventDefault();
+      sampleDrawing(event);
+      return;
+    }
+    if (eraserPointer.current === event.pointerId) {
+      event.preventDefault();
+      const samples = event.nativeEvent.getCoalescedEvents?.() ?? [event.nativeEvent];
+      for (const sample of samples.length ? samples : [event.nativeEvent]) eraseAt(sample.clientX, sample.clientY);
+      return;
+    }
     const pan = panRef.current;
     if (pan?.pointerId === event.pointerId) {
       event.preventDefault();
+      if (Math.hypot(event.clientX - pan.clientX, event.clientY - pan.clientY) >= 4) pan.moved = true;
       applyCamera({ ...cameraRef.current, scrollLeft: pan.origin.scrollLeft - (event.clientX - pan.clientX), scrollTop: pan.origin.scrollTop - (event.clientY - pan.clientY) });
       return;
     }
@@ -378,7 +716,37 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
   };
 
   const endViewportPointer = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (panRef.current?.pointerId === event.pointerId) panRef.current = null;
+    if (event.pointerType === 'touch') {
+      touches.current.delete(event.pointerId);
+      if (pinchRef.current) {
+        pinchRef.current = null;
+        const remaining = [...touches.current.entries()];
+        if (remaining.length >= 2) startPinch();
+        else if (remaining.length === 1) {
+          const [id, point] = remaining[0];
+          panRef.current = { pointerId: id, clientX: point.x, clientY: point.y, origin: cameraRef.current, moved: true };
+        } else {
+          panRef.current = null;
+          touchGesture.current = false;
+        }
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+        clearPointerCursor();
+        return;
+      }
+    }
+    if (activeDrawing.current?.pointerId === event.pointerId) finishDrawing(event);
+    if (eraserPointer.current === event.pointerId) {
+      if (event.type === 'pointerup') eraseAt(event.clientX, event.clientY);
+      eraserPointer.current = null;
+      erasedIds.current.clear();
+    }
+    const pan = panRef.current;
+    if (pan?.pointerId === event.pointerId) {
+      if (event.type === 'pointerup' && !pan.moved && !touchGesture.current && event.button !== 1 && !tool) {
+        pressCandidate.current = { at: performance.now(), x: event.clientX, y: event.clientY, pointerType: event.pointerType };
+      }
+      panRef.current = null;
+    }
     const drag = marqueeRef.current;
     if (drag?.pointerId === event.pointerId) {
       if (event.type === 'pointerup') {
@@ -386,12 +754,16 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
           const rect = selectionRect(drag.start, pointerOnCanvas(event.clientX, event.clientY));
           selectWithin(rect);
           lastMarqueeEnd.current = performance.now();
-        } else selectIds(new Set());
+        } else {
+          selectIds(new Set());
+          if (!tool) pressCandidate.current = { at: performance.now(), x: event.clientX, y: event.clientY, pointerType: event.pointerType };
+        }
       } else selectIds(new Set());
       marqueeRef.current = null;
       setMarquee(null);
     }
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    if (event.pointerType === 'touch' && touches.current.size === 0) touchGesture.current = false;
     if (event.pointerType === 'touch' || event.type === 'pointercancel') clearPointerCursor();
   };
 
@@ -488,24 +860,53 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
   };
 
   const createAtPointer = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (tool || performance.now() < suppressDoubleClickUntil.current) return;
     const target = event.target as HTMLElement;
     if (target.closest('button, a, input, textarea, .pdf-text-layer span, .note-item')) return;
     if (lastMarqueeEnd.current && performance.now() - lastMarqueeEnd.current < 400) return;
-    const { x, y } = pointerOnCanvas(event.clientX, event.clientY);
-    const page = nearestPage(pages, y);
-    if (!page) return;
-    const id = session.createNote(page.number, x - page.x, y - page.y, nextNoteFontSize);
-    newNoteIds.current.add(id);
-    selectNote(id);
-    setEditingId(id);
-    session.setEditingNote(id);
-    session.activity();
+    createNoteAt(event.clientX, event.clientY);
   };
 
-  const shareUrl = `${window.location.origin}/r/${encodeURIComponent(manifest.id)}#${encodeURIComponent(accessToken)}`;
+  const currentShareView = (): SharedView => {
+    const viewport = viewportRef.current;
+    const current = cameraRef.current;
+    const centerX = (current.scrollLeft + (viewport?.clientWidth ?? viewportSize.width) / 2) / current.zoom;
+    const centerY = (current.scrollTop + (viewport?.clientHeight ?? viewportSize.height) / 2) / current.zoom;
+    const page = nearestPage(pages, centerY) ?? pages[0];
+    return page ? {
+      page: page.number,
+      x: clamp(centerX - page.x, -10_000_000, 10_000_000),
+      y: clamp(centerY - page.y, -10_000_000, 10_000_000),
+      zoom: current.zoom,
+    } : { page: 1, zoom: current.zoom };
+  };
+  const shareUrl = localOnly ? '' : buildShareUrl(window.location.origin, manifest.id, accessToken, currentShareView());
   const copyShare = async () => {
-    try { await navigator.clipboard.writeText(shareUrl); setShareCopied(true); }
+    const currentUrl = buildShareUrl(window.location.origin, manifest.id, accessToken, currentShareView());
+    try { await navigator.clipboard.writeText(currentUrl); setShareCopied(true); }
     catch { setShareCopied(false); setShareOpen(true); }
+  };
+  const uploadFromShare = async () => {
+    if (!onUpload || shareBusy || uploadState) return;
+    setShareBusy(true);
+    setShareActionError(null);
+    try {
+      await session.flush();
+      await saveCamera(cameraStorageId, cameraRef.current);
+      await onUpload(async () => {
+        await session.flush();
+        await saveCamera(cameraStorageId, cameraRef.current);
+      });
+    } catch (error) {
+      setShareActionError(error instanceof Error ? error.message : 'This file could not be uploaded.');
+    } finally {
+      setShareBusy(false);
+    }
+  };
+  const toggleTool = (next: Exclude<Tool, null>) => {
+    clearDrawing();
+    pressCandidate.current = null;
+    setTool(current => current === next ? null : next);
   };
   const saveLabel = snapshot.saveState === 'saved' ? 'Saved locally' : snapshot.saveState === 'saving' ? 'Saving locally…' : snapshot.saveState === 'pending' ? 'Waiting to save…' : 'Save failed';
 
@@ -524,9 +925,12 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
       <div className="workspace-left"><button type="button" className="brand brand-button" onClick={onHome} aria-label="Back to home">notora<span>.</span></button><span className="topbar-separator" /><span className="document-title" title={manifest.title}>{manifest.title}</span></div>
       <div className="workspace-actions">
         <button type="button" className={`toolbar-button outline-toggle${outlineOpen ? ' is-active' : ''}`} aria-label="Toggle outline" aria-expanded={outlineOpen} onClick={() => setOutlineOpen(value => !value)}><OutlineIcon /><span>Outline</span></button>
+        <div className="drawing-tools" role="group" aria-label="Drawing tools">
+          {(['pen', 'arrow', 'eraser', 'text'] as const).map(value => <button key={value} type="button" className={`toolbar-button drawing-tool${tool === value ? ' is-active' : ''}`} aria-label={`${value[0].toUpperCase()}${value.slice(1)} tool`} aria-pressed={tool === value} onClick={() => toggleTool(value)}>{value[0].toUpperCase()}{value.slice(1)}</button>)}
+        </div>
         <div className="zoom-group" aria-label="Zoom controls"><button type="button" aria-label="Zoom out" disabled={zoom <= MIN_ZOOM} onClick={() => changeZoom(zoom - ZOOM_STEP)}>−</button><span>{Math.round(zoom * 100)}%</span><button type="button" aria-label="Zoom in" disabled={zoom >= MAX_ZOOM} onClick={() => changeZoom(zoom + ZOOM_STEP)}>+</button></div>
         <div className="topbar-separator share-separator" />
-        <div className="share-wrap"><button type="button" className="toolbar-button share-button" aria-expanded={shareOpen} onClick={() => { setShareOpen(value => !value); setShareCopied(false); }}>Share</button>{shareOpen && <div className="share-popover"><strong>Share this PDF</strong><p>Anyone with this link can read and write notes.</p><div className="share-link-row"><input aria-label="Share link" readOnly value={shareUrl} onFocus={event => event.currentTarget.select()} /><button type="button" onClick={() => void copyShare()}>{shareCopied ? 'Copied' : 'Copy'}</button></div></div>}</div>
+        <div className="share-wrap"><button type="button" className="toolbar-button share-button" aria-expanded={shareOpen} onClick={() => { setShareOpen(value => !value); setShareCopied(false); setShareActionError(null); }}>Share</button>{shareOpen && <div className="share-popover"><strong>Share this PDF</strong>{localOnly ? <><p>Upload this file to create a link for collaborators.</p><button type="button" className="primary-button share-upload-button" disabled={!onUpload || shareBusy || !!uploadState} onClick={() => void uploadFromShare()}>Upload this file</button>{uploadState && <div className="share-upload-state" role="status">{uploadState.status === 'uploading' ? `Uploading… ${Math.round(uploadState.progress)}%` : 'Processing PDF…'}</div>}{(shareActionError || uploadError) && <p className="form-error share-error" role="alert">{shareActionError || uploadError}</p>}</> : <><p>Anyone with this link can read and write notes. The link opens at your current location.</p><div className="share-link-row"><input aria-label="Share link" readOnly value={shareUrl} onFocus={event => event.currentTarget.select()} /><button type="button" onClick={() => void copyShare()}>{shareCopied ? 'Copied' : 'Copy'}</button></div></>}</div>}</div>
       </div>
       <div className="workspace-presence"><div className="participant-list" aria-label="Participants">{snapshot.participants.map(participant => <button key={participant.clientId} type="button" className="participant-pill" title={participant.cursor ? `Jump to ${participant.name}` : participant.name} aria-label={participant.cursor ? `Jump to ${participant.name}` : participant.name} disabled={!participant.cursor} onClick={() => jumpToCursor(participant.cursor)}><span className="participant-avatar" style={{ backgroundColor: participant.color }}>{participant.name.slice(0, 1).toUpperCase()}</span><span className="participant-name">{participant.name}</span></button>)}</div><span className={`connection-indicator ${snapshot.connection}`} title={snapshot.connection} /><span className={`save-status ${snapshot.saveState}`} role="status" title={snapshot.error || undefined}>{saveLabel}</span></div>
     </header>
@@ -534,7 +938,7 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
       {outlineOpen && <aside className="outline-panel"><div className="outline-heading"><h2>Outline</h2><button type="button" aria-label="Close outline" onClick={() => setOutlineOpen(false)}>×</button></div>{manifest.outline.length ? <nav aria-label="PDF outline"><OutlineList items={manifest.outline} depth={0} onDestination={moveTo} /></nav> : <p className="outline-empty">No outline in this PDF.</p>}</aside>}
       <div className="viewer-wrap"><div className="viewer-viewport" ref={viewportRef} tabIndex={-1} onPointerDown={beginViewportPointer} onPointerEnter={setPointerCursor} onPointerMove={event => { moveViewportPointer(event); setPointerCursor(event); }} onPointerUp={endViewportPointer} onPointerCancel={endViewportPointer} onLostPointerCapture={endViewportPointer} onPointerLeave={clearPointerCursor} onDoubleClick={createAtPointer} onAuxClick={event => { if (event.button === 1) event.preventDefault(); }} aria-label={`${manifest.title} pages`}>
           <div className="pdf-stage" style={{ width: size.width, height: size.height, transform: `translate(${-camera.scrollLeft}px, ${-camera.scrollTop}px) scale(${zoom})` }}>
-            {renderedPages.map(page => <PdfPage key={`${manifest.version}:${page.number}`} page={page} documentId={manifest.id} version={manifest.version} accessToken={accessToken} zoom={zoom} active={nearbyPageNumbers.has(page.number)} retain={desktop} onReady={onPageReady} onDestination={moveTo} />)}
+            {renderedPages.map(page => <PdfPage key={`${manifest.version}:${page.number}`} page={page} documentId={manifest.id} version={manifest.version} accessToken={accessToken} localPdf={localPdf} zoom={zoom} active={nearbyPageNumbers.has(page.number)} retain={desktop} onReady={onPageReady} onDestination={moveTo} />)}
             <div className="notes-layer" aria-label="Notes">{visibleNotes.map(note => <NoteEditor
               key={note.id}
               note={note}
@@ -563,8 +967,10 @@ function WorkspaceContent({ manifest, accessToken, profile, onHome, session }: W
             />)}</div>
             <div className="cursors-layer" aria-hidden="true">{snapshot.participants.filter(participant => participant.cursor).map(participant => <div key={participant.clientId} className="remote-cursor" style={{ left: participant.cursor!.x, top: participant.cursor!.y, color: participant.color }}><span className="cursor-pointer" /><span className="cursor-name" style={{ backgroundColor: participant.color }}>{participant.name}</span></div>)}</div>
           </div>
+          <DrawingLayer ref={drawingLayerRef} drawings={snapshot.drawings} previews={snapshot.drawingPreviews} pages={pages} camera={camera} width={viewportSize.width} height={viewportSize.height} />
+          {tool && <div className={`tool-pointer-shield tool-${tool}`} aria-hidden="true" />}
           {marquee && <div className="selection-marquee" aria-hidden="true" style={{ left: marquee.x * zoom - camera.scrollLeft, top: marquee.y * zoom - camera.scrollTop, width: marquee.width * zoom, height: marquee.height * zoom }} />}
-      </div>{snapshot.notes.length === 0 && <div className="viewer-hint">Double-click to add a note</div>}</div>
+      </div>{!tool && snapshot.notes.length === 0 && snapshot.drawings.length === 0 && <div className="viewer-hint">Double-click to add a note</div>}</div>
     </div>
   </div>;
 }

@@ -2,6 +2,7 @@ import { memo, useEffect, useRef, useState } from 'react';
 import { getDocument, GlobalWorkerOptions, TextLayer } from 'pdfjs-dist';
 import type { Destination, PageLayout, PageLink } from '../../../../packages/shared/src/index';
 import { getPageBytes, getPageLinks } from '../lib/api';
+import type { LocalPdfSource } from '../lib/localPdf';
 
 GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString();
 
@@ -53,9 +54,10 @@ export interface PdfPageProps {
   retain: boolean;
   onReady: (pageNumber: number) => void;
   onDestination: (destination: Destination) => void;
+  localPdf?: LocalPdfSource;
 }
 
-export const PdfPage = memo(function PdfPage({ page, documentId, version, accessToken, zoom, active, retain, onReady, onDestination }: PdfPageProps) {
+export const PdfPage = memo(function PdfPage({ page, documentId, version, accessToken, zoom, active, retain, onReady, onDestination, localPdf }: PdfPageProps) {
   const canvasSlotRef = useRef<HTMLDivElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
   const renderedRatio = useRef(0);
@@ -82,7 +84,7 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
       linksController.current?.abort();
       linksController.current = null;
     };
-  }, [documentId, version, page.number, page.width, page.height, accessToken]);
+  }, [documentId, version, page.number, page.width, page.height, accessToken, localPdf]);
 
   // Desktop keeps completed pages mounted. Mobile can clear an inactive page
   // even if its parent has not yet unmounted it.
@@ -112,7 +114,7 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
     if (!active || linksLoaded.current || linksController.current) return;
     const controller = new AbortController();
     linksController.current = controller;
-    getPageLinks(documentId, page.number, accessToken, controller.signal)
+    (localPdf ? localPdf.getPageLinks(page.number) : getPageLinks(documentId, page.number, accessToken, controller.signal))
       .then(value => {
         if (controller.signal.aborted) return;
         linksLoaded.current = true;
@@ -124,7 +126,7 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
         setLinks([]);
       })
       .finally(() => { if (linksController.current === controller) linksController.current = null; });
-  }, [active, documentId, version, page.number, accessToken]);
+  }, [active, documentId, version, page.number, accessToken, localPdf]);
 
   useEffect(() => {
     if (!active || settledZoom === zoom) return;
@@ -160,23 +162,29 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
     const render = async () => {
       try {
         release = await acquirePage(controller.signal);
-        const cachedBytes = await getPageBytes(documentId, version, page.number, accessToken, controller.signal);
+        let pdfPage;
+        if (localPdf) {
+          pdfPage = await localPdf.getPage(page.number);
+        } else {
+          const cachedBytes = await getPageBytes(documentId, version, page.number, accessToken, controller.signal);
+          if (controller.signal.aborted) return;
+          // PDF.js transfers the input buffer to its worker; keep the cache copy intact.
+          loadingTask = getDocument({
+            data: new Uint8Array(cachedBytes),
+            disableAutoFetch: true,
+            disableStream: true,
+            cMapUrl: '/pdf-assets/cmaps/',
+            cMapPacked: true,
+            standardFontDataUrl: '/pdf-assets/standard_fonts/',
+            wasmUrl: '/pdf-assets/wasm/',
+            iccUrl: '/pdf-assets/iccs/',
+            useSystemFonts: true,
+          });
+          const pdf = await loadingTask.promise;
+          if (controller.signal.aborted) return;
+          pdfPage = await pdf.getPage(1);
+        }
         if (controller.signal.aborted) return;
-        // PDF.js transfers the input buffer to its worker; keep the cache copy intact.
-        loadingTask = getDocument({
-          data: new Uint8Array(cachedBytes),
-          disableAutoFetch: true,
-          disableStream: true,
-          cMapUrl: '/pdf-assets/cmaps/',
-          cMapPacked: true,
-          standardFontDataUrl: '/pdf-assets/standard_fonts/',
-          wasmUrl: '/pdf-assets/wasm/',
-          iccUrl: '/pdf-assets/iccs/',
-          useSystemFonts: true,
-        });
-        const pdf = await loadingTask.promise;
-        if (controller.signal.aborted) return;
-        const pdfPage = await pdf.getPage(1);
         cleanupPage = () => pdfPage.cleanup();
         const base = pdfPage.getViewport({ scale: 1 });
         const canonicalScale = page.width / base.width;
@@ -250,7 +258,7 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
       textLayer?.cancel();
       void destroyDocument();
     };
-  }, [active, documentId, version, page.number, page.width, page.height, accessToken, zoom, settledZoom, retry]);
+  }, [active, documentId, version, page.number, page.width, page.height, accessToken, zoom, settledZoom, retry, localPdf]);
 
   return <div className="pdf-page" data-page={page.number} style={{ left: page.x, top: page.y, width: page.width, height: page.height }}>
     <div ref={canvasSlotRef} style={{ width: '100%', height: '100%' }} aria-hidden="true" />

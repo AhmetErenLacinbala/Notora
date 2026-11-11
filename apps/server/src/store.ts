@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
+import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdir, open, opendir, readFile, readdir, rename, rm, stat, truncate, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { Transform } from 'node:stream';
@@ -99,6 +99,8 @@ export class DocumentStore {
   private queue: string[] = [];
   private processing = false;
   private idleResolvers: Array<() => void> = [];
+  private fingerprints = new Map<string, Promise<{ sha256: string; size: number }>>();
+  private fingerprintTail: Promise<unknown> = Promise.resolve();
 
   constructor(
     readonly dataDir: string,
@@ -150,6 +152,38 @@ export class DocumentStore {
     if (!record || !validToken(accessToken, record.accessHash)) return null;
     if (ownerToken !== undefined && !validToken(ownerToken, record.ownerHash)) return null;
     return { record, owner: ownerToken !== undefined };
+  }
+
+  fingerprint(id: string): Promise<{ sha256: string; size: number }> {
+    const record = this.getRecord(id);
+    if (!record) return Promise.reject(new UploadError(404, 'Document unavailable'));
+    if (record.manifest.contentHash) return Promise.resolve({ sha256: record.manifest.contentHash, size: record.uploadedBytes });
+    const pending = this.fingerprints.get(id);
+    if (pending) return pending;
+    // Serialize disk scans and coalesce duplicate requests. Never load the PDF
+    // into a Buffer; large legacy documents need only a bounded read window.
+    const work = this.fingerprintTail.catch(() => {}).then(async () => {
+      if (this.getRecord(id)?.manifest.status === 'processing') await this.waitForIdle();
+      const current = this.getRecord(id)!;
+      if (current.manifest.contentHash) return { sha256: current.manifest.contentHash, size: current.uploadedBytes };
+      const digest = createHash('sha256');
+      for await (const chunk of createReadStream(join(this.documentDir(id), 'original.pdf'), { highWaterMark: 128 * 1024 })) digest.update(chunk);
+      const sha256 = digest.digest('hex');
+      const latest = this.getRecord(id)!;
+      const next = { ...latest, manifest: { ...latest.manifest, contentHash: sha256 } };
+      const extraBytes = Buffer.byteLength(JSON.stringify(next)) - Buffer.byteLength(JSON.stringify(latest));
+      this.reserve(extraBytes);
+      try {
+        await writeJsonDurable(join(this.documentDir(id), 'record.json'), next);
+        this.documents.set(id, next);
+        this.usedBytes += extraBytes;
+      } finally { this.reservedBytes -= extraBytes; }
+      return { sha256, size: next.uploadedBytes };
+    });
+    this.fingerprints.set(id, work);
+    this.fingerprintTail = work.catch(() => {});
+    void work.finally(() => { this.fingerprints.delete(id); }).catch(() => {});
+    return work;
   }
 
   private reserve(bytes: number): void {

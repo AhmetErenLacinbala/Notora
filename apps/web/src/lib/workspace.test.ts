@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
-  noteFontSize, type ClientMessage, type DocumentManifest, type NoteMeta,
+  noteFontSize, type ClientMessage, type CubicBezier, type DocumentManifest, type DrawingMeta, type NoteMeta,
   type ServerMessage, type SessionOptions,
 } from '../../../../packages/shared/src/index';
+import { decodeCurves, drawingBounds, encodeCurves } from './drawingGeometry';
 
 const persistence = vi.hoisted(() => ({
   states: new Map<string, Uint8Array>(),
@@ -52,6 +53,12 @@ function options(owner = false): SessionOptions {
     manifest, accessToken: 'access', ownerToken: owner ? 'owner' : undefined,
     profile: { id: owner ? 'owner-profile' : 'guest-profile', name: owner ? 'Owner' : 'Guest' },
   };
+}
+
+const drawingCurves: CubicBezier[] = [[0, 0, 5, -5, 15, 5, 20, 0]];
+
+function drawingMeta(y = 830): Omit<DrawingMeta, 'id'> {
+  return { kind: 'stroke', anchorPage: 1, x: 20, y, width: 2, bounds: drawingBounds(drawingCurves, 2, 'stroke') };
 }
 
 async function online(session: WorkspaceSession): Promise<Socket> {
@@ -381,6 +388,128 @@ describe('WorkspaceSession', () => {
     const restored = new Y.Doc();
     Y.applyUpdate(restored, Uint8Array.from(atob(state.update), char => char.charCodeAt(0)));
     expect(restored.getText('text').toString()).toBe('before and after');
+    await session.destroy();
+  });
+
+  it('keeps local-only drawings under storageId across the transition to a shared document', async () => {
+    const local = new WorkspaceSession({ ...options(true), manifest: { ...manifest, id: 'local-temp' }, storageId: 'stable-file', localOnly: true });
+    local.connect();
+    await vi.waitFor(() => expect(vi.mocked(getYState)).toHaveBeenCalledWith('stable-file', 'index'));
+    expect(local.getSnapshot().connection).toBe('local');
+    expect(Socket.instances).toHaveLength(0);
+    const id = local.createDrawing(drawingMeta(20), drawingCurves);
+    local.setVisibleRange(0, 100);
+    expect(local.getSnapshot().drawings[0]).toMatchObject({ id, curves: drawingCurves });
+    await local.flush();
+    expect(persistence.states.has('stable-file:index')).toBe(true);
+    expect(persistence.states.has(`stable-file:drawing:${id}`)).toBe(true);
+    await local.destroy();
+
+    const shared = new WorkspaceSession({ ...options(true), manifest: { ...manifest, id: 'uploaded-document' }, storageId: 'stable-file' });
+    shared.setVisibleRange(0, 100);
+    const socket = await online(shared);
+    await vi.waitFor(() => expect(shared.getSnapshot().drawings[0]?.curves).toEqual(drawingCurves));
+    expect((socket.sent[0] as Extract<ClientMessage, { type: 'join' }>).documentId).toBe('uploaded-document');
+    expect(socket.sent.some(message => message.type === 'state' && message.key === `drawing:${id}`)).toBe(true);
+    await shared.destroy();
+  });
+
+  it('queues offscreen owner geometry, loads a crossing-page stroke lazily, and ignores a late body after deletion', async () => {
+    const owner = new WorkspaceSession(options(true));
+    const guest = new WorkspaceSession(options());
+    const ownerSocket = await online(owner);
+    const guestSocket = await online(guest);
+    owner.setVisibleRange(0, 100);
+    const id = guest.createDrawing(drawingMeta(), drawingCurves);
+    ownerSocket.receive({ type: 'update', key: 'index', update: updateFor(guestSocket, 'index').update });
+    const bodyUpdate = updateFor(guestSocket, `drawing:${id}`).update;
+    ownerSocket.receive({ type: 'update', key: `drawing:${id}`, update: bodyUpdate });
+    expect(owner.getSnapshot().drawings[0]).toMatchObject({ id, curves: null });
+    expect(vi.mocked(getYState)).not.toHaveBeenCalledWith('document', `drawing:${id}`);
+    await owner.flush();
+    const saved = persistence.states.get(`document:drawing:${id}`)!;
+    const body = new Y.Doc();
+    Y.applyUpdate(body, saved);
+    expect(decodeCurves(body.getMap('geometry').get('curves') as Uint8Array)).toEqual(drawingCurves);
+    owner.setVisibleRange(860, 870); // The drawing starts on page one and crosses into page two.
+    await vi.waitFor(() => expect(owner.getSnapshot().drawings[0]?.curves).toEqual(drawingCurves));
+
+    guest.deleteDrawings([id]);
+    ownerSocket.receive({ type: 'update', key: 'index', update: updateFor(guestSocket, 'index').update });
+    ownerSocket.receive({ type: 'update', key: `drawing:${id}`, update: bodyUpdate });
+    expect(owner.getSnapshot().drawings).toEqual([]);
+    vi.useFakeTimers();
+    ownerSocket.close();
+    await vi.advanceTimersByTimeAsync(500);
+    const reconnected = Socket.instances.at(-1)!;
+    reconnected.open();
+    reconnected.receive({ type: 'welcome', clientId: 'client', participants: [] });
+    expect(reconnected.sent.some(message => message.type === 'state' && message.key === `drawing:${id}`)).toBe(false);
+    await owner.flush();
+    await owner.destroy();
+    await guest.destroy();
+
+    vi.useRealTimers();
+    Socket.instances.length = 0;
+    const reopened = new WorkspaceSession(options(true));
+    reopened.setVisibleRange(860, 870);
+    await online(reopened);
+    expect(reopened.getSnapshot().drawings).toEqual([]);
+    await reopened.destroy();
+  });
+
+  it('replays offline drawing state after reconnect and answers a drawing state request', async () => {
+    const session = new WorkspaceSession(options(true));
+    const first = await online(session);
+    vi.useFakeTimers();
+    first.close();
+    const id = session.createDrawing(drawingMeta(20), drawingCurves);
+    await vi.advanceTimersByTimeAsync(500);
+    const second = Socket.instances.at(-1)!;
+    second.open();
+    second.receive({ type: 'welcome', clientId: 'client', participants: [] });
+    expect(second.sent.some(message => message.type === 'state' && message.key === `drawing:${id}`)).toBe(true);
+    const prior = second.sent.filter(message => message.type === 'state' && message.key === `drawing:${id}`).length;
+    second.receive({ type: 'need-state', keys: [`drawing:${id}`] });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(second.sent.filter(message => message.type === 'state' && message.key === `drawing:${id}`).length).toBeGreaterThan(prior);
+    await session.destroy();
+  });
+
+  it('accumulates delta previews and clears them on final geometry, disconnect and expiry', async () => {
+    const session = new WorkspaceSession(options(true));
+    const socket = await online(session);
+    session.setVisibleRange(0, 100);
+    const base = { id: 'remote-stroke', kind: 'stroke' as const, anchorPage: 1, x: 20, y: 20, width: 2 };
+    socket.receive({ type: 'drawing-preview', clientId: 'remote', preview: { ...base, seq: 0, points: [{ x: 0, y: 0 }] } });
+    socket.receive({ type: 'drawing-preview', clientId: 'remote', preview: { ...base, seq: 1, points: [{ x: 5, y: 1 }] } });
+    expect(session.getSnapshot().drawingPreviews[0]).toMatchObject({ clientId: 'remote', seq: 1, points: [{ x: 0, y: 0 }, { x: 5, y: 1 }] });
+    socket.receive({ type: 'drawing-preview', clientId: 'remote', preview: { ...base, seq: 3, points: [{ x: 9, y: 1 }] } });
+    expect(session.getSnapshot().drawingPreviews).toEqual([]);
+    socket.receive({ type: 'drawing-preview', clientId: 'remote', preview: { ...base, seq: 0, points: [{ x: 0, y: 0 }] } });
+    const index = new Y.Doc();
+    index.getMap<DrawingMeta>('drawings').set(base.id, { ...base, bounds: drawingBounds(drawingCurves, 2, 'stroke') });
+    socket.receive({ type: 'update', key: 'index', update: Buffer.from(Y.encodeStateAsUpdate(index)).toString('base64') });
+    expect(session.getSnapshot().drawingPreviews).toHaveLength(1);
+    socket.receive({ type: 'drawing-preview', clientId: 'remote', preview: null });
+    expect(session.getSnapshot().drawingPreviews).toHaveLength(1); // Keep it until geometry is ready.
+    const body = new Y.Doc();
+    body.transact(() => {
+      body.getMap('geometry').set('version', 1);
+      body.getMap('geometry').set('curves', encodeCurves(drawingCurves));
+    });
+    socket.receive({ type: 'update', key: `drawing:${base.id}`, update: Buffer.from(Y.encodeStateAsUpdate(body)).toString('base64') });
+    await vi.waitFor(() => expect(session.getSnapshot().drawingPreviews).toEqual([]));
+
+    socket.receive({ type: 'drawing-preview', clientId: 'other', preview: { ...base, id: 'other-stroke', seq: 0, points: [{ x: 0, y: 0 }] } });
+    expect(session.getSnapshot().drawingPreviews).toHaveLength(1);
+    socket.receive({ type: 'participants', participants: [] });
+    expect(session.getSnapshot().drawingPreviews).toEqual([]);
+
+    vi.useFakeTimers();
+    socket.receive({ type: 'drawing-preview', clientId: 'other', preview: { ...base, id: 'third-stroke', seq: 0, points: [{ x: 0, y: 0 }] } });
+    await vi.advanceTimersByTimeAsync(9_001);
+    expect(session.getSnapshot().drawingPreviews).toEqual([]);
     await session.destroy();
   });
 });

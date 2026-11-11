@@ -153,6 +153,17 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
     return reply.header('Cache-Control', 'private, no-store').send(auth.record.manifest);
   });
 
+  app.get<{ Params: { id: string } }>('/api/documents/:id/fingerprint', async (request, reply) => {
+    const token = bearer(request.headers.authorization);
+    if (!token) return reply.code(401).send({ error: 'Document unavailable' });
+    const ownerToken = request.headers['x-owner-token'];
+    if (typeof ownerToken !== 'string' || !store.authorize(request.params.id, token, ownerToken)?.owner) {
+      return reply.code(404).send({ error: 'Document unavailable' });
+    }
+    try { return reply.header('Cache-Control', 'private, no-store').send(await store.fingerprint(request.params.id)); }
+    catch { return reply.code(503).send({ error: 'Fingerprint unavailable' }); }
+  });
+
   app.get<{ Params: { id: string; number: string }; Querystring: { v?: string } }>(
     '/api/documents/:id/pages/:number.pdf', async (request, reply) => {
       const auth = authorized(request.params.id, request.headers.authorization);
@@ -195,6 +206,7 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
   if (existsSync(webDir)) {
     await app.register(fastifyStatic, { root: webDir, prefix: '/', wildcard: false });
     app.get<{ Params: { documentId: string } }>('/r/:documentId', async (_request, reply) => reply.sendFile('index.html'));
+    app.get<{ Params: { documentId: string } }>('/local/:documentId', async (_request, reply) => reply.sendFile('index.html'));
   }
 
   app.setNotFoundHandler(async (_request, reply) => reply.code(404).send({ error: 'Not found' }));

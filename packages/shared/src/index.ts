@@ -20,12 +20,13 @@ export interface PageLink { rect: [number, number, number, number]; destination?
 export interface DocumentManifest {
   schemaVersion: 1; id: string; version: string; title: string; status: 'processing' | 'ready' | 'error';
   pageCount: number; pages: PageInfo[]; outline: OutlineItem[]; error?: string;
+  contentHash?: string;
 }
 export interface UploadResult { documentId: string; accessToken: string; ownerToken: string }
 export const MAX_UPLOAD_CHUNK_BYTES = 1024 * 1024;
 export interface UploadSession { uploadId: string; uploadToken: string; offset: number }
 export interface UploadStatus { offset: number; size: number }
-export interface OwnedProject extends UploadResult { title: string; createdAt: number; lastOpenedAt: number }
+export interface OwnedProject extends UploadResult { title: string; createdAt: number; lastOpenedAt: number; storageId?: string; contentHash?: string }
 export interface Camera { scrollLeft: number; scrollTop: number; zoom: number }
 // x/y relative to anchor page top-left, in unzoomed canonical CSS points.
 // lineCount is rebuildable metadata for vertical visibility; never width/height.
@@ -33,14 +34,31 @@ export interface NoteMeta { id: string; anchorPage: number; x: number; y: number
 export type NotePatch = Partial<Pick<NoteMeta, 'x' | 'y' | 'fontSize'>>;
 export interface TextNote extends NoteMeta { text: string | null }
 export interface CursorPosition { x: number; y: number }
+export type CubicBezier = [number, number, number, number, number, number, number, number];
+export interface DrawingBounds { minX: number; minY: number; maxX: number; maxY: number }
+export interface DrawingMeta {
+  id: string; kind: 'stroke' | 'arrow'; anchorPage: number; x: number; y: number;
+  width: number; bounds: DrawingBounds;
+}
+export interface DrawingShape extends DrawingMeta { curves: CubicBezier[] | null }
+export interface DrawingPreviewPacket {
+  id: string; kind: 'stroke' | 'arrow'; anchorPage: number; x: number; y: number;
+  width: number; seq: number; points: CursorPosition[];
+}
+export interface RemoteDrawingPreview extends DrawingPreviewPacket { clientId: string }
+export const drawingKey = (id: string) => `drawing:${id}`;
+export const MAX_DRAWING_SEGMENTS = 4096;
+export const MAX_PREVIEW_POINTS = 256;
 export interface Participant { clientId: string; name: string; color: string; cursor: CursorPosition | null; owner: boolean }
 export type SaveState = 'saved' | 'pending' | 'saving' | 'error';
 export interface WorkspaceSnapshot {
-  notes: TextNote[]; participants: Participant[]; connection: 'connecting' | 'online' | 'offline';
+  notes: TextNote[]; drawings: DrawingShape[]; drawingPreviews: RemoteDrawingPreview[];
+  participants: Participant[]; connection: 'connecting' | 'online' | 'offline' | 'local';
   saveState: SaveState; error: string | null;
 }
 export interface SessionOptions {
   manifest: DocumentManifest; accessToken: string; ownerToken?: string; profile: Profile;
+  storageId?: string; localOnly?: boolean;
 }
 export interface WorkspaceSessionApi {
   connect(): void; destroy(): Promise<void>; subscribe(listener: () => void): () => void;
@@ -49,6 +67,10 @@ export interface WorkspaceSessionApi {
   createNote(anchorPage: number, x: number, y: number, fontSize?: number): string;
   setNoteText(id: string, text: string): void; deleteNote(id: string): void;
   updateNote(id: string, patch: NotePatch): void; deleteNotes(ids: string[]): void;
+  createDrawing(meta: Omit<DrawingMeta, 'id'>, curves: CubicBezier[], id?: string): string;
+  updateDrawing(id: string, patch: { x?: number; y?: number }): void;
+  deleteDrawings(ids: string[]): void;
+  sendDrawingPreview(preview: DrawingPreviewPacket | null): void;
   setCursor(cursor: CursorPosition | null): void; activity(): void; flush(): Promise<void>;
 }
 export type ClientMessage =
@@ -56,6 +78,7 @@ export type ClientMessage =
   | { type: 'subscribe'; keys: string[] }
   | { type: 'update'; key: string; update: string }
   | { type: 'state'; key: string; update: string }
+  | { type: 'drawing-preview'; preview: DrawingPreviewPacket | null }
   | { type: 'cursor'; cursor: CursorPosition | null };
 export type ServerMessage =
   | { type: 'welcome'; clientId: string; participants: Participant[] }
@@ -63,6 +86,7 @@ export type ServerMessage =
   | { type: 'update'; key: string; update: string }
   | { type: 'need-state'; keys: string[] }
   | { type: 'cursor'; clientId: string; cursor: CursorPosition | null }
+  | { type: 'drawing-preview'; clientId: string; preview: DrawingPreviewPacket | null }
   | { type: 'error'; message: string };
 
 export interface PageLayout extends PageInfo { x: number; y: number }

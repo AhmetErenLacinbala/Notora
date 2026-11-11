@@ -1,15 +1,21 @@
 import * as Y from 'yjs';
 import {
-  INDEX_KEY, MAX_NOTE_FONT_SIZE, MIN_NOTE_FONT_SIZE, SAVE_IDLE_MS, TEXT_FONT_SIZE,
-  noteIntersects, noteKey, pageLayout,
-  type ClientMessage, type CursorPosition, type NoteMeta, type NotePatch, type Participant,
-  type SessionOptions, type ServerMessage, type TextNote, type WorkspaceSessionApi,
+  INDEX_KEY, MAX_DRAWING_SEGMENTS, MAX_NOTE_FONT_SIZE, MAX_PREVIEW_POINTS,
+  MIN_NOTE_FONT_SIZE, SAVE_IDLE_MS, TEXT_FONT_SIZE,
+  drawingKey, noteIntersects, noteKey, pageLayout,
+  type ClientMessage, type CubicBezier, type CursorPosition, type DrawingMeta,
+  type DrawingPreviewPacket, type DrawingShape, type NoteMeta, type NotePatch, type Participant,
+  type RemoteDrawingPreview, type SessionOptions, type ServerMessage, type TextNote, type WorkspaceSessionApi,
   type WorkspaceSnapshot,
 } from '../../../../packages/shared/src/index';
+import { decodeCurves, drawingBounds, encodeCurves } from './drawingGeometry';
 import { getYState, saveYUpdates } from './storage';
 
 const MAX_MESSAGE_BYTES = 12 * 1024 * 1024;
 const MAX_NOTE_LENGTH = 1_000_000;
+const MAX_PREVIEW_BUFFERED_POINTS = 8192;
+const PREVIEW_IDLE_MS = 8_000;
+const MAX_COORDINATE = 10_000_000;
 
 function encode(bytes: Uint8Array): string {
   let binary = '';
@@ -42,7 +48,38 @@ function validMeta(value: unknown, id: string, pageCount: number): value is Note
 
 function validCursor(cursor: CursorPosition | null): boolean {
   return cursor === null || Number.isFinite(cursor.x) && Number.isFinite(cursor.y) &&
-    Math.abs(cursor.x) <= 10_000_000 && Math.abs(cursor.y) <= 10_000_000;
+    Math.abs(cursor.x) <= MAX_COORDINATE && Math.abs(cursor.y) <= MAX_COORDINATE;
+}
+
+function validDrawingMeta(value: unknown, id: string, pageCount: number): value is DrawingMeta {
+  if (!value || typeof value !== 'object' || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) return false;
+  const meta = value as Partial<DrawingMeta>;
+  const bounds = meta.bounds;
+  return meta.id === id && (meta.kind === 'stroke' || meta.kind === 'arrow') &&
+    Number.isSafeInteger(meta.anchorPage) && meta.anchorPage! >= 1 && meta.anchorPage! <= pageCount &&
+    typeof meta.x === 'number' && Number.isFinite(meta.x) && Math.abs(meta.x) <= MAX_COORDINATE &&
+    typeof meta.y === 'number' && Number.isFinite(meta.y) && Math.abs(meta.y) <= MAX_COORDINATE &&
+    typeof meta.width === 'number' && Number.isFinite(meta.width) && meta.width > 0 && meta.width <= 256 &&
+    !!bounds && [bounds.minX, bounds.minY, bounds.maxX, bounds.maxY].every(
+      number => typeof number === 'number' && Number.isFinite(number) && Math.abs(number) <= MAX_COORDINATE) &&
+    bounds.minX <= bounds.maxX && bounds.minY <= bounds.maxY;
+}
+
+function validPreview(value: unknown, pageCount: number): value is DrawingPreviewPacket {
+  if (!value || typeof value !== 'object') return false;
+  const packet = value as Partial<DrawingPreviewPacket>;
+  return validDrawingMeta({ ...packet, bounds: { minX: 0, minY: 0, maxX: 0, maxY: 0 } }, packet.id ?? '', pageCount) &&
+    Number.isSafeInteger(packet.seq) && packet.seq! >= 0 && packet.seq! <= 1_000_000 &&
+    Array.isArray(packet.points) && packet.points.length > 0 && packet.points.length <= MAX_PREVIEW_POINTS &&
+    packet.points.every(point => !!point && typeof point === 'object' && validCursor(point));
+}
+
+function drawingIntersects(meta: DrawingMeta, layouts: ReturnType<typeof pageLayout>, top: number, bottom: number): boolean {
+  const page = layouts[meta.anchorPage - 1];
+  if (!page) return false;
+  const drawingTop = page.y + meta.y + meta.bounds.minY;
+  const drawingBottom = page.y + meta.y + meta.bounds.maxY;
+  return drawingTop <= bottom && drawingBottom >= top;
 }
 
 function sameSet(a: Set<string>, b: Set<string>): boolean {
@@ -52,11 +89,18 @@ function sameSet(a: Set<string>, b: Set<string>): boolean {
 export class WorkspaceSession implements WorkspaceSessionApi {
   private readonly index = new Y.Doc();
   private readonly metadata = this.index.getMap<NoteMeta>('notes');
+  private readonly drawingMetadata = this.index.getMap<DrawingMeta>('drawings');
   private readonly layouts: ReturnType<typeof pageLayout>;
+  private readonly storageId: string;
   private readonly clientId = crypto.randomUUID();
   private readonly listeners = new Set<() => void>();
   private readonly bodies = new Map<string, Y.Doc>();
   private readonly loadingBodies = new Map<string, Promise<Y.Doc | undefined>>();
+  private readonly drawingBodies = new Map<string, Y.Doc>();
+  private readonly loadingDrawingBodies = new Map<string, Promise<Y.Doc | undefined>>();
+  private readonly decodedCurves = new WeakMap<Uint8Array, CubicBezier[] | null>();
+  private readonly previewByClient = new Map<string, { preview: RemoteDrawingPreview; updatedAt: number }>();
+  private previewTimer: ReturnType<typeof setInterval> | null = null;
   private readonly pendingText = new Map<string, string>();
   private pendingWrites = new Map<string, Uint8Array[]>();
   private savingWrites: Map<string, Uint8Array[]> | null = null;
@@ -77,11 +121,13 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   private flushPromise: Promise<void> | null = null;
   private participants: Participant[] = [];
   private snapshot: WorkspaceSnapshot = {
-    notes: [], participants: [], connection: 'offline', saveState: 'saved', error: null,
+    notes: [], drawings: [], drawingPreviews: [], participants: [], connection: 'offline', saveState: 'saved', error: null,
   };
 
   constructor(private readonly options: SessionOptions) {
     this.layouts = pageLayout(options.manifest.pages);
+    this.storageId = options.storageId ?? options.manifest.id;
+    if (options.localOnly) this.snapshot = { ...this.snapshot, connection: 'local' };
     this.index.on('update', (update: Uint8Array, origin: unknown) => {
       if (origin !== 'load') this.queueWrite(INDEX_KEY, update);
       if (origin !== 'remote' && origin !== 'load') this.sendUpdate(INDEX_KEY, update);
@@ -90,12 +136,23 @@ export class WorkspaceSession implements WorkspaceSessionApi {
       this.refreshNotes();
       this.refreshVisibleNotes();
     });
+    this.drawingMetadata.observe(() => {
+      for (const [id, body] of this.drawingBodies) {
+        if (this.drawingMetadata.has(id)) continue;
+        body.destroy();
+        this.drawingBodies.delete(id);
+        this.unsentUpdates.delete(drawingKey(id));
+        this.pendingWrites.delete(drawingKey(id));
+      }
+      this.refreshDrawings();
+      this.refreshVisibleNotes();
+    });
   }
 
   connect(): void {
     if (this.started || this.destroyed) return;
     this.started = true;
-    this.publish({ connection: 'connecting' });
+    this.publish({ connection: this.options.localOnly ? 'local' : 'connecting' });
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', this.onVisibilityChange);
       window.addEventListener('pagehide', this.onPageHide);
@@ -105,7 +162,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
 
   private async initialize(): Promise<void> {
     try {
-      const saved = await getYState(this.options.manifest.id, INDEX_KEY);
+      const saved = await getYState(this.storageId, INDEX_KEY);
       if (this.destroyed) return;
       if (saved) Y.applyUpdate(this.index, saved, 'load');
     } catch {
@@ -113,8 +170,9 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     }
     if (this.destroyed) return;
     this.refreshNotes();
+    this.refreshDrawings();
     this.refreshVisibleNotes();
-    this.openSocket();
+    if (!this.options.localOnly) this.openSocket();
   }
 
   subscribe(listener: () => void): () => void {
@@ -142,6 +200,56 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     this.publish({ notes });
   }
 
+  private refreshDrawings(): void {
+    const drawings: DrawingShape[] = [];
+    let clearedPreview = false;
+    for (const [id, value] of this.drawingMetadata) {
+      if (!validDrawingMeta(value, id, this.options.manifest.pageCount)) continue;
+      const encoded = this.drawingBodies.get(id)?.getMap('geometry').get('curves');
+      const curves = this.curvesFor(encoded);
+      drawings.push({ ...value, curves });
+      if (curves) {
+        for (const [clientId, state] of this.previewByClient) {
+          if (state.preview.id === id) {
+            this.previewByClient.delete(clientId);
+            clearedPreview = true;
+          }
+        }
+      }
+    }
+    if (clearedPreview) this.publishPreviews();
+    drawings.sort((a, b) => a.anchorPage - b.anchorPage || a.y - b.y || a.x - b.x || a.id.localeCompare(b.id));
+    this.publish({ drawings });
+  }
+
+  private curvesFor(encoded: unknown): CubicBezier[] | null {
+    if (!(encoded instanceof Uint8Array)) return null;
+    if (this.decodedCurves.has(encoded)) return this.decodedCurves.get(encoded) ?? null;
+    const curves = decodeCurves(encoded);
+    this.decodedCurves.set(encoded, curves);
+    return curves;
+  }
+
+  private publishPreviews(): void {
+    this.publish({ drawingPreviews: [...this.previewByClient.values()].map(state => state.preview) });
+    if (this.previewByClient.size === 0 && this.previewTimer) {
+      clearInterval(this.previewTimer);
+      this.previewTimer = null;
+    } else if (this.previewByClient.size > 0 && !this.previewTimer) {
+      this.previewTimer = setInterval(() => {
+        const now = Date.now();
+        let changed = false;
+        for (const [clientId, state] of this.previewByClient) {
+          if (now - state.updatedAt > PREVIEW_IDLE_MS) {
+            this.previewByClient.delete(clientId);
+            changed = true;
+          }
+        }
+        if (changed) this.publishPreviews();
+      }, 1_000);
+    }
+  }
+
   setVisibleRange(top: number, bottom: number): void {
     if (!Number.isFinite(top) || !Number.isFinite(bottom)) return;
     this.visibleTop = Math.min(top, bottom);
@@ -161,11 +269,18 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     for (const [id, value] of this.metadata) {
       if (validMeta(value, id, this.options.manifest.pageCount) &&
           noteIntersects(value, this.layouts, this.visibleTop, this.visibleBottom)) {
-        desired.add(id);
+        desired.add(noteKey(id));
         void this.ensureBody(id);
       }
     }
-    if (this.editingNoteId && this.metadata.has(this.editingNoteId)) desired.add(this.editingNoteId);
+    for (const [id, value] of this.drawingMetadata) {
+      if (validDrawingMeta(value, id, this.options.manifest.pageCount) &&
+          drawingIntersects(value, this.layouts, this.visibleTop, this.visibleBottom)) {
+        desired.add(drawingKey(id));
+        void this.ensureDrawingBody(id);
+      }
+    }
+    if (this.editingNoteId && this.metadata.has(this.editingNoteId)) desired.add(noteKey(this.editingNoteId));
     if (sameSet(desired, this.desired)) return;
     this.desired = desired;
     this.sendSubscriptions();
@@ -175,7 +290,70 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     if (!this.welcomed || !this.isOpen()) return;
     if (this.subscribed && sameSet(this.desired, this.subscribed)) return;
     this.subscribed = new Set(this.desired);
-    this.send({ type: 'subscribe', keys: [...this.desired].map(noteKey) });
+    this.send({ type: 'subscribe', keys: [...this.desired] });
+  }
+
+  createDrawing(meta: Omit<DrawingMeta, 'id'>, curves: CubicBezier[], providedId?: string): string {
+    const id = providedId ?? crypto.randomUUID();
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(id) || this.drawingMetadata.has(id)) {
+      throw new Error('Invalid drawing ID.');
+    }
+    if (!validDrawingMeta({ ...meta, id }, id, this.options.manifest.pageCount) ||
+        !Array.isArray(curves) || curves.length < 1 || curves.length > MAX_DRAWING_SEGMENTS ||
+        !curves.every(curve => Array.isArray(curve) && curve.length === 8 && curve.every(
+          coordinate => Number.isFinite(coordinate) && Math.abs(coordinate) <= MAX_COORDINATE))) {
+      throw new Error('Invalid drawing.');
+    }
+    const bytes = encodeCurves(curves);
+    const canonical = { ...meta, bounds: drawingBounds(decodeCurves(bytes)!, meta.width, meta.kind) };
+    if (!validDrawingMeta({ ...canonical, id }, id, this.options.manifest.pageCount)) {
+      throw new Error('Invalid drawing bounds.');
+    }
+    const doc = new Y.Doc();
+    this.attachDrawingBody(id, doc);
+    this.drawingBodies.set(id, doc);
+    this.drawingMetadata.set(id, { ...canonical, id });
+    doc.transact(() => {
+      doc.getMap('geometry').set('version', 1);
+      doc.getMap('geometry').set('curves', bytes);
+    }, 'local');
+    this.refreshDrawings();
+    this.refreshVisibleNotes();
+    return id;
+  }
+
+  updateDrawing(id: string, patch: { x?: number; y?: number }): void {
+    const previous = this.drawingMetadata.get(id);
+    if (!previous || !patch || typeof patch !== 'object') return;
+    const changes: { x?: number; y?: number } = {};
+    for (const axis of ['x', 'y'] as const) {
+      if (!Object.hasOwn(patch, axis)) continue;
+      const value = patch[axis];
+      if (typeof value !== 'number' || !Number.isFinite(value) || Math.abs(value) > MAX_COORDINATE) return;
+      if (value !== previous[axis]) changes[axis] = value;
+    }
+    if (Object.keys(changes).length) this.drawingMetadata.set(id, { ...previous, ...changes });
+  }
+
+  deleteDrawings(ids: string[]): void {
+    const unique = [...new Set(ids)].filter(id => this.drawingMetadata.has(id));
+    if (unique.length === 0) return;
+    this.index.transact(() => {
+      for (const id of unique) this.drawingMetadata.delete(id);
+    }, 'local');
+    for (const id of unique) {
+      this.unsentUpdates.delete(drawingKey(id));
+      this.pendingWrites.delete(drawingKey(id));
+      this.drawingBodies.get(id)?.destroy();
+      this.drawingBodies.delete(id);
+    }
+    this.refreshDrawings();
+    this.refreshVisibleNotes();
+  }
+
+  sendDrawingPreview(preview: DrawingPreviewPacket | null): void {
+    if (this.options.localOnly || (preview !== null && !validPreview(preview, this.options.manifest.pageCount))) return;
+    this.send({ type: 'drawing-preview', preview });
   }
 
   createNote(anchorPage: number, x: number, y: number, fontSize = TEXT_FONT_SIZE): string {
@@ -279,6 +457,16 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     });
   }
 
+  private attachDrawingBody(id: string, doc: Y.Doc): void {
+    doc.on('update', (update: Uint8Array, origin: unknown) => {
+      if (!this.drawingMetadata.has(id)) return;
+      const key = drawingKey(id);
+      if (origin !== 'load') this.queueWrite(key, update);
+      if (origin !== 'remote' && origin !== 'load') this.sendUpdate(key, update);
+      this.refreshDrawings();
+    });
+  }
+
   private syncLineCount(id: string, doc: Y.Doc): void {
     const previous = this.metadata.get(id);
     if (!previous) return;
@@ -309,13 +497,43 @@ export class WorkspaceSession implements WorkspaceSessionApi {
         this.setNoteText(id, edit);
       }
       this.refreshNotes();
-      if (this.welcomed && this.subscribed?.has(id)) this.sendState(noteKey(id), Y.encodeStateAsUpdate(doc));
+      if (this.welcomed && this.subscribed?.has(noteKey(id))) this.sendState(noteKey(id), Y.encodeStateAsUpdate(doc));
       return doc;
     })().catch(() => {
       this.publish({ error: 'This note could not be loaded.' });
       return undefined;
     }).finally(() => { this.loadingBodies.delete(id); });
     this.loadingBodies.set(id, task);
+    return task;
+  }
+
+  private ensureDrawingBody(id: string): Promise<Y.Doc | undefined> {
+    const existing = this.drawingBodies.get(id);
+    if (existing) return Promise.resolve(existing);
+    const inProgress = this.loadingDrawingBodies.get(id);
+    if (inProgress) return inProgress;
+    const task = (async () => {
+      let saved: Uint8Array | undefined;
+      try {
+        saved = await this.readMergedState(drawingKey(id));
+      } catch {
+        this.publish({ saveState: 'error', error: 'Browser storage could not be read.' });
+      }
+      if (this.destroyed || !this.drawingMetadata.has(id)) return undefined;
+      const doc = new Y.Doc();
+      if (saved) Y.applyUpdate(doc, saved, 'load');
+      this.attachDrawingBody(id, doc);
+      this.drawingBodies.set(id, doc);
+      this.refreshDrawings();
+      if (this.welcomed && this.subscribed?.has(drawingKey(id))) {
+        this.sendState(drawingKey(id), Y.encodeStateAsUpdate(doc));
+      }
+      return doc;
+    })().catch(() => {
+      this.publish({ error: 'This drawing could not be loaded.' });
+      return undefined;
+    }).finally(() => { this.loadingDrawingBodies.delete(id); });
+    this.loadingDrawingBodies.set(id, task);
     return task;
   }
 
@@ -327,6 +545,44 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   private visibleParticipants(participants: Participant[]): Participant[] {
     return participants.map(participant => participant.clientId === this.clientId
       ? { ...participant, cursor: null } : participant);
+  }
+
+  private receiveDrawingPreview(clientId: string, packet: DrawingPreviewPacket | null): void {
+    if (clientId === this.clientId || !/^[A-Za-z0-9_-]{1,128}$/.test(clientId)) return;
+    const previous = this.previewByClient.get(clientId);
+    if (previous && Date.now() - previous.updatedAt > PREVIEW_IDLE_MS) {
+      this.previewByClient.delete(clientId);
+      this.publishPreviews();
+    }
+    if (packet === null) {
+      const active = this.previewByClient.get(clientId)?.preview;
+      if (active && this.drawingMetadata.has(active.id) &&
+          !this.drawingBodies.get(active.id)?.getMap('geometry').has('curves')) return;
+      if (this.previewByClient.delete(clientId)) this.publishPreviews();
+      return;
+    }
+    if (!validPreview(packet, this.options.manifest.pageCount) || this.drawingMetadata.has(packet.id)) {
+      if (this.previewByClient.delete(clientId)) this.publishPreviews();
+      return;
+    }
+    const old = this.previewByClient.get(clientId)?.preview;
+    if (old && (old.id !== packet.id || old.kind !== packet.kind || old.anchorPage !== packet.anchorPage ||
+        old.x !== packet.x || old.y !== packet.y || old.width !== packet.width ||
+        packet.seq !== 0 && packet.seq !== old.seq + 1)) {
+      this.previewByClient.delete(clientId);
+      this.publishPreviews();
+      return;
+    }
+    if (!old && packet.seq !== 0 || (packet.seq === 0 ? 0 : old?.points.length ?? 0) + packet.points.length > MAX_PREVIEW_BUFFERED_POINTS) {
+      this.previewByClient.delete(clientId);
+      this.publishPreviews();
+      return;
+    }
+    this.previewByClient.set(clientId, {
+      preview: { ...packet, points: old && packet.seq !== 0 ? [...old.points, ...packet.points] : [...packet.points], clientId },
+      updatedAt: Date.now(),
+    });
+    this.publishPreviews();
   }
 
   activity(): void {
@@ -347,7 +603,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     // and still-pending updates in the returned binary state.
     for (;;) {
       const revision = this.persistRevision;
-      const saved = await getYState(this.options.manifest.id, key);
+      const saved = await getYState(this.storageId, key);
       if (revision !== this.persistRevision) continue;
       const updates = [
         ...(saved ? [saved] : []),
@@ -379,7 +635,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     this.pendingWrites = new Map();
     this.savingWrites = batch;
     this.publish({ saveState: 'saving', error: null });
-    const task = saveYUpdates(this.options.manifest.id, batch);
+    const task = saveYUpdates(this.storageId, batch);
     this.flushPromise = task;
     try {
       await task;
@@ -402,7 +658,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   private openSocket(): void {
-    if (this.destroyed || typeof WebSocket === 'undefined') return;
+    if (this.destroyed || this.options.localOnly || typeof WebSocket === 'undefined') return;
     const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const socket = new WebSocket(`${scheme}//${location.host}/ws`);
     this.socket = socket;
@@ -432,6 +688,8 @@ export class WorkspaceSession implements WorkspaceSessionApi {
       this.welcomed = false;
       this.subscribed = null;
       this.participants = [];
+      this.previewByClient.clear();
+      this.publishPreviews();
       this.publish({ connection: 'offline', participants: [] });
       this.reconnectTimer = setTimeout(() => {
         this.reconnectTimer = null;
@@ -455,6 +713,9 @@ export class WorkspaceSession implements WorkspaceSessionApi {
         this.sendState(INDEX_KEY, Y.encodeStateAsUpdate(this.index));
         this.sendSubscriptions();
         for (const [id, doc] of this.bodies) this.sendState(noteKey(id), Y.encodeStateAsUpdate(doc));
+        for (const [id, doc] of this.drawingBodies) {
+          if (this.drawingMetadata.has(id)) this.sendState(drawingKey(id), Y.encodeStateAsUpdate(doc));
+        }
         for (const [key, updates] of this.unsentUpdates) {
           this.sendUpdate(key, Y.mergeUpdates(updates));
         }
@@ -462,6 +723,12 @@ export class WorkspaceSession implements WorkspaceSessionApi {
         break;
       case 'participants':
         this.participants = this.visibleParticipants(message.participants);
+        for (const clientId of this.previewByClient.keys()) {
+          if (!message.participants.some(participant => participant.clientId === clientId)) {
+            this.previewByClient.delete(clientId);
+          }
+        }
+        this.publishPreviews();
         this.publish({ participants: this.participants });
         break;
       case 'cursor':
@@ -472,6 +739,9 @@ export class WorkspaceSession implements WorkspaceSessionApi {
         break;
       case 'update':
         this.applyRemote(message.key, decode(message.update));
+        break;
+      case 'drawing-preview':
+        this.receiveDrawingPreview(message.clientId, message.preview);
         break;
       case 'need-state':
         await Promise.all(message.keys.map(key => this.sendStoredState(key)));
@@ -487,23 +757,27 @@ export class WorkspaceSession implements WorkspaceSessionApi {
       Y.applyUpdate(this.index, update, 'remote');
       return;
     }
-    if (!key.startsWith('note:')) return;
-    const id = key.slice(5);
-    const body = this.bodies.get(id);
+    const drawing = key.startsWith('drawing:');
+    if (!drawing && !key.startsWith('note:')) return;
+    const id = key.slice(drawing ? 8 : 5);
+    if (drawing ? !this.drawingMetadata.has(id) : !this.metadata.has(id)) return;
+    const body = drawing ? this.drawingBodies.get(id) : this.bodies.get(id);
     if (body) {
       Y.applyUpdate(body, update, 'remote');
     } else {
-      // The owner receives guest changes even for notes outside the viewport.
+      // The owner receives guest changes even for items outside the viewport.
       // Keep the binary update for a delayed IndexedDB merge without opening a Y.Doc.
       this.queueWrite(key, update);
     }
   }
 
   private async sendStoredState(key: string): Promise<void> {
-    if (key !== INDEX_KEY && !key.startsWith('note:')) return;
-    const id = key.startsWith('note:') ? key.slice(5) : '';
-    if (id && !this.metadata.has(id)) return;
-    const current = key === INDEX_KEY ? this.index : this.bodies.get(id);
+    const note = key.startsWith('note:');
+    const drawing = key.startsWith('drawing:');
+    if (key !== INDEX_KEY && !note && !drawing) return;
+    const id = note ? key.slice(5) : drawing ? key.slice(8) : '';
+    if (note && !this.metadata.has(id) || drawing && !this.drawingMetadata.has(id)) return;
+    const current = key === INDEX_KEY ? this.index : note ? this.bodies.get(id) : this.drawingBodies.get(id);
     const updates: Uint8Array[] = [];
     if (current) updates.push(Y.encodeStateAsUpdate(current));
     const saved = await this.readMergedState(key).catch(() => undefined);
@@ -526,6 +800,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   private sendUpdate(key: string, update: Uint8Array): void {
+    if (this.options.localOnly) return;
     if (this.welcomed && this.send({ type: 'update', key, update: encode(update) })) return;
     const pending = this.unsentUpdates.get(key) ?? [];
     pending.push(update);
@@ -545,6 +820,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     this.destroyed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.saveTimer) clearTimeout(this.saveTimer);
+    if (this.previewTimer) clearInterval(this.previewTimer);
     if (typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', this.onVisibilityChange);
       window.removeEventListener('pagehide', this.onPageHide);
@@ -553,6 +829,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     this.socket = null;
     try { await this.flush(); } catch { /* saveState retains the error */ }
     for (const doc of this.bodies.values()) doc.destroy();
+    for (const doc of this.drawingBodies.values()) doc.destroy();
     this.index.destroy();
     this.listeners.clear();
   }

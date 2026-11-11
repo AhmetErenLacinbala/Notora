@@ -1,6 +1,18 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 import * as Y from 'yjs';
-import type { Camera, OwnedProject, Profile } from '../../../../packages/shared/src/index';
+import type { Camera, DocumentManifest, OwnedProject, Profile, UploadResult } from '../../../../packages/shared/src/index';
+
+export interface LocalDocumentRecord {
+  id: string;
+  title: string;
+  contentHash: string;
+  size: number;
+  createdAt: number;
+  lastOpenedAt: number;
+  storageId: string;
+  manifest?: DocumentManifest;
+  upload?: UploadResult;
+}
 
 interface NotoraDatabase extends DBSchema {
   profile: { key: string; value: Profile };
@@ -8,18 +20,26 @@ interface NotoraDatabase extends DBSchema {
   cameras: { key: string; value: Camera };
   pages: { key: string; value: Uint8Array };
   yUpdates: { key: string; value: Uint8Array };
+  localDocuments: { key: string; value: LocalDocumentRecord };
+  localBlobs: { key: string; value: Blob };
 }
 
 let databasePromise: Promise<IDBPDatabase<NotoraDatabase>> | undefined;
 
 function database(): Promise<IDBPDatabase<NotoraDatabase>> {
-  databasePromise ??= openDB<NotoraDatabase>('notora', 1, {
-    upgrade(db) {
-      db.createObjectStore('profile');
-      db.createObjectStore('ownedProjects');
-      db.createObjectStore('cameras');
-      db.createObjectStore('pages');
-      db.createObjectStore('yUpdates');
+  databasePromise ??= openDB<NotoraDatabase>('notora', 2, {
+    upgrade(db, oldVersion) {
+      if (oldVersion < 1) {
+        db.createObjectStore('profile');
+        db.createObjectStore('ownedProjects');
+        db.createObjectStore('cameras');
+        db.createObjectStore('pages');
+        db.createObjectStore('yUpdates');
+      }
+      if (oldVersion < 2) {
+        db.createObjectStore('localDocuments');
+        db.createObjectStore('localBlobs');
+      }
     },
   });
   return databasePromise;
@@ -44,6 +64,86 @@ export async function saveOwnedProject(project: OwnedProject): Promise<void> {
 
 export async function getOwnedProject(id: string): Promise<OwnedProject | undefined> {
   return (await database()).get('ownedProjects', id);
+}
+
+export async function listLocalDocuments(): Promise<LocalDocumentRecord[]> {
+  const documents = await (await database()).getAll('localDocuments');
+  return documents.sort((a, b) => b.lastOpenedAt - a.lastOpenedAt || b.createdAt - a.createdAt);
+}
+
+export async function getLocalDocument(id: string): Promise<LocalDocumentRecord | undefined> {
+  return (await database()).get('localDocuments', id);
+}
+
+export async function importLocalBlob(proposal: LocalDocumentRecord, blob: Blob): Promise<LocalDocumentRecord> {
+  const db = await database();
+  const tx = db.transaction(['localDocuments', 'localBlobs'], 'readwrite');
+  const documents = tx.objectStore('localDocuments');
+  const blobs = tx.objectStore('localBlobs');
+  const existing = await documents.get(proposal.id);
+  const record = existing ? { ...existing, lastOpenedAt: proposal.lastOpenedAt } : proposal;
+  if (!(await blobs.count(proposal.id))) await blobs.put(blob, proposal.id);
+  await documents.put(record, proposal.id);
+  await tx.done;
+  return record;
+}
+
+export async function updateLocalManifest(id: string, manifest: DocumentManifest): Promise<LocalDocumentRecord> {
+  const db = await database();
+  const tx = db.transaction('localDocuments', 'readwrite');
+  const record = await tx.store.get(id);
+  if (!record) throw new Error('This local PDF is unavailable.');
+  const updated = { ...record, manifest, lastOpenedAt: Date.now() };
+  await tx.store.put(updated, id);
+  await tx.done;
+  return updated;
+}
+
+export async function saveLocalUploadAndOwned(record: LocalDocumentRecord, project: OwnedProject): Promise<LocalDocumentRecord> {
+  if (!record.upload) throw new Error('The shared PDF mapping is incomplete.');
+  const db = await database();
+  const tx = db.transaction(['localDocuments', 'ownedProjects'], 'readwrite');
+  const documents = tx.objectStore('localDocuments');
+  const latest = await documents.get(record.id);
+  if (latest?.upload && latest.upload.documentId !== record.upload.documentId) {
+    await tx.done;
+    return latest;
+  }
+  const updated = {
+    ...latest, ...record,
+    manifest: record.manifest ?? latest?.manifest,
+    lastOpenedAt: Math.max(record.lastOpenedAt, latest?.lastOpenedAt ?? 0),
+  };
+  await documents.put(updated, record.id);
+  await tx.objectStore('ownedProjects').put(project, project.documentId);
+  await tx.done;
+  return updated;
+}
+
+export async function getLocalBlob(id: string): Promise<Blob | undefined> {
+  return (await database()).get('localBlobs', id);
+}
+
+// Keep the legacy remote notes while adopting their ID as the local record's
+// storage ID. This copies and merges rather than deleting either set of data.
+export async function mergeWorkspaceStorage(fromId: string, toId: string): Promise<void> {
+  if (fromId === toId) return;
+  const db = await database();
+  const tx = db.transaction(['yUpdates', 'cameras'], 'readwrite');
+  const updates = tx.objectStore('yUpdates');
+  const fromPrefix = `${fromId}\u0000`;
+  let cursor = await updates.openCursor(IDBKeyRange.bound(fromPrefix, `${fromPrefix}\uffff`));
+  while (cursor) {
+    const key = String(cursor.key);
+    const target = `${toId}\u0000${key.slice(fromPrefix.length)}`;
+    const prior = await updates.get(target);
+    await updates.put(prior ? Y.mergeUpdates([prior, cursor.value]) : cursor.value, target);
+    cursor = await cursor.continue();
+  }
+  const cameras = tx.objectStore('cameras');
+  const localCamera = await cameras.get(fromId);
+  if (localCamera) await cameras.put(localCamera, toId);
+  await tx.done;
 }
 
 export async function loadCamera(id: string): Promise<Camera | undefined> {

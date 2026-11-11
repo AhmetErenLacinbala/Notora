@@ -1,0 +1,42 @@
+# Drawing and local-first PDF integration
+
+This user-authorized update supersedes older no-drawing and upload-on-open scope. Keep UI minimal. Root owns shared schema, curve fitting, geometry helpers, share-link helpers, fingerprint endpoint, integration, commits and publishing.
+
+## File ownership this iteration
+- UI agent: Workspace.tsx, new DrawingLayer.tsx (or hooks/components for drawing), styles.css. Do not edit App/PdfPage/data files.
+- Local PDF agent: App.tsx, PdfPage.tsx, storage.ts, new localPdf.ts/localDocuments.ts and tests. No Workspace/styles/shared/package edits.
+- Drawing data agent: workspace.ts/workspace.test.ts, server relay.ts and drawing relay tests. No store.ts/server index.ts or storage.ts edits.
+- Root: shared index.ts, lib/drawingGeometry.ts + tests, lib/shareLink.ts + tests, server store/index fingerprint support, package files and integration.
+
+## Drawing representation
+Shared CubicBezier is [startX,startY,c1X,c1Y,c2X,c2Y,endX,endY]. Coordinates are local to drawing origin; origin x/y is relative to anchorPage. DrawingMeta has id, kind stroke|arrow, anchorPage, x,y,width,bounds(minX,minY,maxX,maxY relative to drawing origin). Bounds include pen width/arrowhead. Constant dark ink, default width 2; no extra color/width UI. DrawingShape adds curves:null for unloaded geometry. Root supplies drawingGeometry exports: fitStroke(points:CursorPosition[], tolerance:number):CubicBezier[]; drawingBounds(curves,width,kind):DrawingBounds; hitDrawing(curves,point,radius,kind,width):boolean; encodeCurves(curves):Uint8Array; decodeCurves(bytes):CubicBezier[]|null; traceCurves(context,curves):void; drawArrowHead(context,curves,width):void. No pressure UI/variable width in this version.
+
+Yjs index adds getMap<DrawingMeta>('drawings'); body key drawing:<id> has getMap('geometry').get('curves') containing encoded bytes, version=1. Preserve existing notes. Final geometry commits once; binary IDB updates retain 10s input-idle behavior. Load only visible drawing bodies based on full bounds across pages. Offscreen owner receives/queues binary state; reconnect/need-state works for both kinds. Never mutate finalized curves in place. Deletes remove index entry; late body data never resurrects an object.
+
+Preview message is drawing-preview with preview:DrawingPreviewPacket|null. seq starts0 then increments; points is NEW point batch (max256). Receiver accumulates per client, requires same ID/next seq, bounds max total buffered samples, removes on null, final matching drawing, disconnect or idle expiry. Transient previews never dirty Yjs/IDB. UI sends at most about25Hz, final nullable clear after commit. Server validates finite values, limits/rate and uses existing room auth; no disk drawing state.
+
+WorkspaceSession gets storageId?:string and localOnly?:boolean. All local Yjs persistence uses storageId??manifest.id. localOnly suppresses websocket entirely and has connection:'local'. Replacing a local workspace with shared remote manifest must flush old session before reopening with SAME storageId; original notes/drawings/camera survive. Guest storage stays manifest.id.
+
+## Workspace/UI integration
+WorkspaceProps additions: storageId?:string; localOnly?:boolean; localPdf?:LocalPdfSource (type imported from lib/localPdf); onUpload?:()=>Promise<void>; uploadState?:{status:'uploading'|'processing';progress:number}|null; uploadError?:string; initialView?:SharedView (lib/shareLink). PdfPage receives localPdf?:LocalPdfSource. Camera load/save uses storageId??manifest.id. App passes these; UI handles Share popover. Local Share shows exact button 'Upload this file', awaits session.flush() then onUpload(). Uploaded Share shows link/copy. No automatic upload, including file selection or mere Share click. App owns upload/status/error and remote route transition.
+
+Topbar tools: Pen, Eraser, Text, plus Arrow authorized earlier. Toggle selected tool off to return existing selection/navigation. Pen/Arrow support mouse/touch/pen; erase whole stroke/arrow on contact, not pixel erasure and not text/PDF. Text adds/focuses textbox on pointerdown. Normal no-tool double-click text behavior remains for two quick releases; second-down drag begins handwriting immediately, before release, and suppresses subsequent dblclick text creation when moved. Await user clarification if supplied. Pointer capture, pointercancel, coalesced events with fallback. Two touch fingers pan/pinch; transitioning to multi-touch cancels the provisional stroke. Preserve PDF text/link interaction when no drawing tool. Draw overlays OUTSIDE PDF page clipping, viewport-sized static + active canvas; input hot path uses refs/RAF, not React updates per sample. Finish by fitting with tolerance around0.75 screen px converted to canonical units. Curves remain retained data, only visible drawing shapes paint. Desktop completed PDF retention remains unchanged.
+
+## Local PDFs and identity
+File open stores original Blob in IndexedDB, opens immediately locally, derives page dimensions/outline using existing PDF.js. Do not rasterize all pages. Use Blob range reads via PDFDataRangeTransport; avoid full-file arrayBuffer. LocalPdfSource public API is agreed by Local PDF agent and sent to UI/root (UI only forwards it). Local source lives for workspace lifecycle and is destroyed on exit; one shared PDF worker, cleanup individual page data after render as appropriate.
+
+Use incremental SHA-256 with @noble/hashes (root installs exact version); read bounded Blob slices. Identical file content reuses a local document or prior owned shared session; filename alone is insufficient. Local history stores metadata separately from blobs; listing Recent must not read entire files. Retain old owned history records. New local record id is stable and used as storageId; shared mapping stores UploadResult. On sharing, reuse saved mapping; if none upload with existing chunk API, persist mapping immediately when result returns (before processing polls) so retries/reload never duplicate a completed upload. Upgrade existing IndexedDB version non-destructively.
+
+Root adds authenticated GET /api/documents/:id/fingerprint returning {sha256,size}; use ONLY previous owned IDs/tokens to associate legacy uploads with a selected file. No global hash lookup or new access grants. Endpoint hashes server original in a stream and caches result in metadata. New manifest.contentHash optional. Local agent may retrieve fingerprints for old owner records lacking contentHash, then store result. Concurrent opens/shares should be coalesced to avoid duplicate upload.
+
+## Share location
+Root supplies SharedView {page:number;x?:number;y?:number;zoom?:number}; parseSharedView(search:string):SharedView|undefined; buildShareUrl(origin,id,token,view):string. URL query has page plus optional page-relative center x/y and zoom, capability remains fragment. UI builds location from current viewport center at share/copy time, initialView overrides saved camera once on entry; validate/clamp page/zoom. Page navigation links retain original numbering. App parses URL and passes initialView.
+
+## Verification
+Meaningful tests for geometric approximation/corners/duplicates/encoding, drawing save/reconnect/owner offscreen updates/delete, preview validation, share URL validation, local identity/reuse/migration. Root verifies UI locally; user explicitly said no live-site checks. No subagent commits, pushes, deploys, or builds while browser verification is running.
+
+## Integration refinements
+- Binary codec lives in packages/shared/src/drawing.ts (NTR1 header, little-endian float32); drawingGeometry reexports it. Server runtime does not import browser source files.
+- createDrawing(meta, curves, id?) accepts the preview ID so final geometry replaces the matching provisional stroke. seq0 can reset an ongoing preview after bounded resampling or an idle pause.
+- onUpload accepts an optional beforeTransition callback. Workspace flushes before starting and supplies another flush to run after upload completes, before switching sessions; edits made during a long upload are included.
+- Local SPA route is /local/:documentId. Fingerprint endpoint also requires x-owner-token; it is an owner-only migration aid.
