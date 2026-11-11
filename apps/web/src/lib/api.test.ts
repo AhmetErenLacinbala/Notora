@@ -10,6 +10,7 @@ vi.mock('./storage', () => ({
 }));
 
 import { getManifest, getPageBytes, getPageLinks, uploadPdf } from './api';
+import { getCachedPage, saveCachedPage } from './storage';
 
 class UploadXHR {
   static instances: UploadXHR[] = [];
@@ -75,23 +76,37 @@ function stubUploadServer(size: number) {
 }
 
 describe('document API', () => {
-  beforeEach(() => pageCache.clear());
+  beforeEach(() => { pageCache.clear(); vi.clearAllMocks(); });
   afterEach(() => vi.unstubAllGlobals());
 
   it('keeps bearer credentials in headers and caches each immutable page version separately', async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
       new Response(new Uint8Array([37, 80, 68, 70]).buffer, { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
-    const first = await getPageBytes('doc', 'v1', 7, 'secret');
+    const first = await getPageBytes('doc', 'v1', 7, 'secret', undefined, 'owner');
     expect([...first]).toEqual([37, 80, 68, 70]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][0]).toBe('/api/documents/doc/pages/7.pdf?v=v1');
     expect(fetchMock.mock.calls[0][1]).toMatchObject({ headers: { Authorization: 'Bearer secret' } });
-    await getPageBytes('doc', 'v1', 7, 'secret');
+    await getPageBytes('doc', 'v1', 7, 'secret', undefined, 'owner');
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    await getPageBytes('doc', 'v2', 7, 'secret');
-    await getPageBytes('doc', 'v1', 8, 'secret');
+    await getPageBytes('doc', 'v2', 7, 'secret', undefined, 'owner');
+    await getPageBytes('doc', 'v1', 8, 'secret', undefined, 'owner');
     expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('never reads or writes persistent pages for guests, even with a legacy cache', async () => {
+    pageCache.set('doc:v1:7', new Uint8Array([1]));
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(new Uint8Array([37, 80, 68, 70]).buffer));
+    vi.stubGlobal('fetch', fetchMock);
+    const first = await getPageBytes('doc', 'v1', 7, 'secret');
+    await getPageBytes('doc', 'v1', 7, 'secret');
+    expect([...first]).toEqual([37, 80, 68, 70]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.every(([, init]) => init?.cache === 'no-store')).toBe(true);
+    expect(getCachedPage).not.toHaveBeenCalled();
+    expect(saveCachedPage).not.toHaveBeenCalled();
   });
 
   it('honors obsolete page requests and fetches manifest and links with bearer credentials', async () => {

@@ -49,6 +49,7 @@ export interface PdfPageProps {
   documentId: string;
   version: string;
   accessToken: string;
+  ownerToken?: string;
   zoom: number;
   active: boolean;
   retain: boolean;
@@ -57,7 +58,7 @@ export interface PdfPageProps {
   localPdf?: LocalPdfSource;
 }
 
-export const PdfPage = memo(function PdfPage({ page, documentId, version, accessToken, zoom, active, retain, onReady, onDestination, localPdf }: PdfPageProps) {
+export const PdfPage = memo(function PdfPage({ page, documentId, version, accessToken, ownerToken, zoom, active, retain, onReady, onDestination, localPdf }: PdfPageProps) {
   const canvasSlotRef = useRef<HTMLDivElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
   const renderedRatio = useRef(0);
@@ -84,7 +85,7 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
       linksController.current?.abort();
       linksController.current = null;
     };
-  }, [documentId, version, page.number, page.width, page.height, accessToken, localPdf]);
+  }, [documentId, version, page.number, page.width, page.height, accessToken, ownerToken, localPdf]);
 
   // Desktop keeps completed pages mounted. Mobile can clear an inactive page
   // even if its parent has not yet unmounted it.
@@ -166,7 +167,7 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
         if (localPdf) {
           pdfPage = await localPdf.getPage(page.number);
         } else {
-          const cachedBytes = await getPageBytes(documentId, version, page.number, accessToken, controller.signal);
+          const cachedBytes = await getPageBytes(documentId, version, page.number, accessToken, controller.signal, ownerToken);
           if (controller.signal.aborted) return;
           // PDF.js transfers the input buffer to its worker; keep the cache copy intact.
           loadingTask = getDocument({
@@ -258,7 +259,7 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
       textLayer?.cancel();
       void destroyDocument();
     };
-  }, [active, documentId, version, page.number, page.width, page.height, accessToken, zoom, settledZoom, retry, localPdf]);
+  }, [active, documentId, version, page.number, page.width, page.height, accessToken, ownerToken, zoom, settledZoom, retry, localPdf]);
 
   return <div className="pdf-page" data-page={page.number} style={{ left: page.x, top: page.y, width: page.width, height: page.height }}>
     <div ref={canvasSlotRef} style={{ width: '100%', height: '100%' }} aria-hidden="true" />

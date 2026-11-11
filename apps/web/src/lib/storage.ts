@@ -262,3 +262,23 @@ export async function saveYUpdates(documentId: string, updates: Map<string, Uint
   }
   await tx.done;
 }
+
+// Old guest page caches are reproducible from the server. Keep annotation
+// records: an older offline edit may still exist only in that browser.
+export async function clearGuestPageCache(documentId: string): Promise<void> {
+  const db = await database();
+  const tx = db.transaction(['ownedProjects', 'pages', 'cameras'], 'readwrite');
+  if (await tx.objectStore('ownedProjects').get(documentId)) {
+    await tx.done;
+    return;
+  }
+  const pages = tx.objectStore('pages');
+  const prefix = `${documentId}\u0000`;
+  let cursor = await pages.openKeyCursor(IDBKeyRange.bound(prefix, `${prefix}\uffff`));
+  while (cursor) {
+    await pages.delete(cursor.primaryKey);
+    cursor = await cursor.continue();
+  }
+  await tx.objectStore('cameras').delete(documentId);
+  await tx.done;
+}

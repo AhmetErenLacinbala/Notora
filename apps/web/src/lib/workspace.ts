@@ -1,6 +1,6 @@
 import * as Y from 'yjs';
 import {
-  INDEX_KEY, MAX_DRAWING_SEGMENTS, MAX_NOTE_FONT_SIZE, MAX_PREVIEW_POINTS,
+  INDEX_KEY, MAX_DRAWING_SEGMENTS, MAX_NOTE_FONT_SIZE, MAX_PREVIEW_POINTS, REMOVED_CLOSE_CODE,
   MIN_NOTE_FONT_SIZE, SAVE_IDLE_MS, TEXT_FONT_SIZE,
   drawingKey, noteIntersects, noteKey, pageLayout,
   type ClientMessage, type CubicBezier, type CursorPosition, type DrawingMeta,
@@ -92,6 +92,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   private readonly drawingMetadata = this.index.getMap<DrawingMeta>('drawings');
   private readonly layouts: ReturnType<typeof pageLayout>;
   private readonly storageId: string;
+  private readonly persistLocally: boolean;
   private readonly clientId = crypto.randomUUID();
   private readonly listeners = new Set<() => void>();
   private readonly bodies = new Map<string, Y.Doc>();
@@ -104,6 +105,8 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   private readonly pendingText = new Map<string, string>();
   private pendingWrites = new Map<string, Uint8Array[]>();
   private savingWrites: Map<string, Uint8Array[]> | null = null;
+  // Guests keep only offscreen body state here. Loaded bodies live in their Y.Doc.
+  private readonly memoryStates = new Map<string, Uint8Array>();
   private persistRevision = 0;
   private unsentUpdates = new Map<string, Uint8Array[]>();
   private socket: WebSocket | null = null;
@@ -114,6 +117,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   private visibleBottom = 0;
   private started = false;
   private destroyed = false;
+  private removed = false;
   private welcomed = false;
   private reconnectDelay = 500;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -122,17 +126,29 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   private participants: Participant[] = [];
   private snapshot: WorkspaceSnapshot = {
     notes: [], drawings: [], drawingPreviews: [], participants: [], connection: 'offline', saveState: 'saved', error: null,
+    isAdmin: false,
   };
 
   constructor(private readonly options: SessionOptions) {
     this.layouts = pageLayout(options.manifest.pages);
     this.storageId = options.storageId ?? options.manifest.id;
+    this.persistLocally = Boolean(options.localOnly || options.ownerToken);
     if (options.localOnly) this.snapshot = { ...this.snapshot, connection: 'local' };
     this.index.on('update', (update: Uint8Array, origin: unknown) => {
-      if (origin !== 'load') this.queueWrite(INDEX_KEY, update);
+      if (origin !== 'load' && this.persistLocally) this.queueWrite(INDEX_KEY, update);
       if (origin !== 'remote' && origin !== 'load') this.sendUpdate(INDEX_KEY, update);
     });
     this.metadata.observe(() => {
+      for (const [id, body] of this.bodies) {
+        if (this.metadata.has(id)) continue;
+        body.destroy();
+        this.bodies.delete(id);
+        this.pendingText.delete(id);
+        this.unsentUpdates.delete(noteKey(id));
+      }
+      for (const key of this.memoryStates.keys()) {
+        if (key.startsWith('note:') && !this.metadata.has(key.slice(5))) this.memoryStates.delete(key);
+      }
       this.refreshNotes();
       this.refreshVisibleNotes();
     });
@@ -144,13 +160,16 @@ export class WorkspaceSession implements WorkspaceSessionApi {
         this.unsentUpdates.delete(drawingKey(id));
         this.pendingWrites.delete(drawingKey(id));
       }
+      for (const key of this.memoryStates.keys()) {
+        if (key.startsWith('drawing:') && !this.drawingMetadata.has(key.slice(8))) this.memoryStates.delete(key);
+      }
       this.refreshDrawings();
       this.refreshVisibleNotes();
     });
   }
 
   connect(): void {
-    if (this.started || this.destroyed) return;
+    if (this.started || this.destroyed || this.removed) return;
     this.started = true;
     this.publish({ connection: this.options.localOnly ? 'local' : 'connecting' });
     if (typeof document !== 'undefined') {
@@ -161,14 +180,16 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   private async initialize(): Promise<void> {
-    try {
-      const saved = await getYState(this.storageId, INDEX_KEY);
-      if (this.destroyed) return;
-      if (saved) Y.applyUpdate(this.index, saved, 'load');
-    } catch {
-      this.publish({ saveState: 'error', error: 'Browser storage could not be read.' });
+    if (this.persistLocally) {
+      try {
+        const saved = await getYState(this.storageId, INDEX_KEY);
+        if (this.destroyed || this.removed) return;
+        if (saved) Y.applyUpdate(this.index, saved, 'load');
+      } catch {
+        if (!this.destroyed && !this.removed) this.publish({ saveState: 'error', error: 'Browser storage could not be read.' });
+      }
     }
-    if (this.destroyed) return;
+    if (this.destroyed || this.removed) return;
     this.refreshNotes();
     this.refreshDrawings();
     this.refreshVisibleNotes();
@@ -251,13 +272,14 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   setVisibleRange(top: number, bottom: number): void {
-    if (!Number.isFinite(top) || !Number.isFinite(bottom)) return;
+    if (this.removed || !Number.isFinite(top) || !Number.isFinite(bottom)) return;
     this.visibleTop = Math.min(top, bottom);
     this.visibleBottom = Math.max(top, bottom);
     this.refreshVisibleNotes();
   }
 
   setEditingNote(id: string | null): void {
+    if (this.removed) return;
     if (id !== null && !this.metadata.has(id)) return;
     this.editingNoteId = id;
     if (id !== null) void this.ensureBody(id);
@@ -265,6 +287,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   private refreshVisibleNotes(): void {
+    if (this.removed) return;
     const desired = new Set<string>();
     for (const [id, value] of this.metadata) {
       if (validMeta(value, id, this.options.manifest.pageCount) &&
@@ -294,6 +317,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   createDrawing(meta: Omit<DrawingMeta, 'id'>, curves: CubicBezier[], providedId?: string): string {
+    if (this.removed) throw new Error('Access to this document was removed.');
     const id = providedId ?? crypto.randomUUID();
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(id) || this.drawingMetadata.has(id)) {
       throw new Error('Invalid drawing ID.');
@@ -323,6 +347,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   updateDrawing(id: string, patch: { x?: number; y?: number }): void {
+    if (this.removed) return;
     const previous = this.drawingMetadata.get(id);
     if (!previous || !patch || typeof patch !== 'object') return;
     const changes: { x?: number; y?: number } = {};
@@ -336,6 +361,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   deleteDrawings(ids: string[]): void {
+    if (this.removed) return;
     const unique = [...new Set(ids)].filter(id => this.drawingMetadata.has(id));
     if (unique.length === 0) return;
     this.index.transact(() => {
@@ -344,6 +370,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     for (const id of unique) {
       this.unsentUpdates.delete(drawingKey(id));
       this.pendingWrites.delete(drawingKey(id));
+      this.memoryStates.delete(drawingKey(id));
       this.drawingBodies.get(id)?.destroy();
       this.drawingBodies.delete(id);
     }
@@ -352,11 +379,12 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   sendDrawingPreview(preview: DrawingPreviewPacket | null): void {
-    if (this.options.localOnly || (preview !== null && !validPreview(preview, this.options.manifest.pageCount))) return;
+    if (this.removed || this.options.localOnly || (preview !== null && !validPreview(preview, this.options.manifest.pageCount))) return;
     this.send({ type: 'drawing-preview', preview });
   }
 
   createNote(anchorPage: number, x: number, y: number, fontSize = TEXT_FONT_SIZE): string {
+    if (this.removed) throw new Error('Access to this document was removed.');
     if (!Number.isSafeInteger(anchorPage) || anchorPage < 1 || anchorPage > this.options.manifest.pageCount ||
         !Number.isFinite(x) || !Number.isFinite(y)) throw new Error('Invalid note position.');
     if (!Number.isFinite(fontSize) || fontSize < MIN_NOTE_FONT_SIZE || fontSize > MAX_NOTE_FONT_SIZE) {
@@ -374,7 +402,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   setNoteText(id: string, text: string): void {
-    if (!this.metadata.has(id) || typeof text !== 'string') return;
+    if (this.removed || !this.metadata.has(id) || typeof text !== 'string') return;
     if (text.length > MAX_NOTE_LENGTH) {
       this.publish({ error: 'A note can contain at most 1,000,000 characters.' });
       return;
@@ -405,6 +433,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   updateNote(id: string, patch: NotePatch): void {
+    if (this.removed) return;
     const previous = this.metadata.get(id);
     if (!previous || !patch || typeof patch !== 'object') return;
     const changes: NotePatch = {};
@@ -432,6 +461,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   deleteNotes(ids: string[]): void {
+    if (this.removed) return;
     const unique = [...new Set(ids)].filter(id => this.metadata.has(id));
     if (unique.length === 0) return;
     this.index.transact(() => {
@@ -440,6 +470,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     for (const id of unique) {
       this.pendingText.delete(id);
       this.unsentUpdates.delete(noteKey(id));
+      this.memoryStates.delete(noteKey(id));
       this.bodies.get(id)?.destroy();
       this.bodies.delete(id);
       if (this.editingNoteId === id) this.editingNoteId = null;
@@ -450,7 +481,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   private attachBody(id: string, doc: Y.Doc): void {
     doc.on('update', (update: Uint8Array, origin: unknown) => {
       const key = noteKey(id);
-      if (origin !== 'load') this.queueWrite(key, update);
+      if (origin !== 'load' && this.persistLocally) this.queueWrite(key, update);
       if (origin !== 'remote' && origin !== 'load') this.sendUpdate(key, update);
       this.syncLineCount(id, doc);
       this.refreshNotes();
@@ -461,7 +492,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     doc.on('update', (update: Uint8Array, origin: unknown) => {
       if (!this.drawingMetadata.has(id)) return;
       const key = drawingKey(id);
-      if (origin !== 'load') this.queueWrite(key, update);
+      if (origin !== 'load' && this.persistLocally) this.queueWrite(key, update);
       if (origin !== 'remote' && origin !== 'load') this.sendUpdate(key, update);
       this.refreshDrawings();
     });
@@ -484,13 +515,19 @@ export class WorkspaceSession implements WorkspaceSessionApi {
       try {
         saved = await this.readMergedState(noteKey(id));
       } catch {
-        this.publish({ saveState: 'error', error: 'Browser storage could not be read.' });
+        if (!this.destroyed && !this.removed) this.publish({ saveState: 'error', error: 'Browser storage could not be read.' });
       }
-      if (this.destroyed || !this.metadata.has(id)) return undefined;
+      if (this.destroyed || this.removed || !this.metadata.has(id)) return undefined;
       const doc = new Y.Doc();
       if (saved) Y.applyUpdate(doc, saved, 'load');
       this.attachBody(id, doc);
       this.bodies.set(id, doc);
+      if (!this.persistLocally) {
+        // An offscreen update may have arrived while the initial read yielded.
+        const latest = this.memoryStates.get(noteKey(id));
+        if (latest) Y.applyUpdate(doc, latest, 'load');
+        this.memoryStates.delete(noteKey(id));
+      }
       const edit = this.pendingText.get(id);
       if (edit !== undefined) {
         this.pendingText.delete(id);
@@ -500,7 +537,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
       if (this.welcomed && this.subscribed?.has(noteKey(id))) this.sendState(noteKey(id), Y.encodeStateAsUpdate(doc));
       return doc;
     })().catch(() => {
-      this.publish({ error: 'This note could not be loaded.' });
+      if (!this.destroyed && !this.removed) this.publish({ error: 'This note could not be loaded.' });
       return undefined;
     }).finally(() => { this.loadingBodies.delete(id); });
     this.loadingBodies.set(id, task);
@@ -517,20 +554,25 @@ export class WorkspaceSession implements WorkspaceSessionApi {
       try {
         saved = await this.readMergedState(drawingKey(id));
       } catch {
-        this.publish({ saveState: 'error', error: 'Browser storage could not be read.' });
+        if (!this.destroyed && !this.removed) this.publish({ saveState: 'error', error: 'Browser storage could not be read.' });
       }
-      if (this.destroyed || !this.drawingMetadata.has(id)) return undefined;
+      if (this.destroyed || this.removed || !this.drawingMetadata.has(id)) return undefined;
       const doc = new Y.Doc();
       if (saved) Y.applyUpdate(doc, saved, 'load');
       this.attachDrawingBody(id, doc);
       this.drawingBodies.set(id, doc);
+      if (!this.persistLocally) {
+        const latest = this.memoryStates.get(drawingKey(id));
+        if (latest) Y.applyUpdate(doc, latest, 'load');
+        this.memoryStates.delete(drawingKey(id));
+      }
       this.refreshDrawings();
       if (this.welcomed && this.subscribed?.has(drawingKey(id))) {
         this.sendState(drawingKey(id), Y.encodeStateAsUpdate(doc));
       }
       return doc;
     })().catch(() => {
-      this.publish({ error: 'This drawing could not be loaded.' });
+      if (!this.destroyed && !this.removed) this.publish({ error: 'This drawing could not be loaded.' });
       return undefined;
     }).finally(() => { this.loadingDrawingBodies.delete(id); });
     this.loadingDrawingBodies.set(id, task);
@@ -538,7 +580,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   setCursor(cursor: CursorPosition | null): void {
-    if (!validCursor(cursor)) return;
+    if (this.removed || !validCursor(cursor)) return;
     this.send({ type: 'cursor', cursor });
   }
 
@@ -586,10 +628,16 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   activity(): void {
-    if (this.pendingWrites.size > 0) this.scheduleSave();
+    if (!this.removed && this.persistLocally && this.pendingWrites.size > 0) this.scheduleSave();
   }
 
   private queueWrite(key: string, update: Uint8Array): void {
+    if (this.removed) return;
+    if (!this.persistLocally) {
+      const previous = this.memoryStates.get(key);
+      this.memoryStates.set(key, Y.mergeUpdates(previous ? [previous, update] : [update]));
+      return;
+    }
     const pending = this.pendingWrites.get(key) ?? [];
     pending.push(update);
     this.pendingWrites.set(key, pending);
@@ -598,6 +646,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   private async readMergedState(key: string): Promise<Uint8Array | undefined> {
+    if (!this.persistLocally) return this.memoryStates.get(key);
     // A flush may move updates out of pendingWrites while an IndexedDB read is
     // waiting. Retry if it committed during that read, then include in-flight
     // and still-pending updates in the returned binary state.
@@ -615,6 +664,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   private scheduleSave(): void {
+    if (!this.persistLocally || this.removed) return;
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
@@ -623,6 +673,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   async flush(): Promise<void> {
+    if (!this.persistLocally || this.removed) return;
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = null;
     if (this.flushPromise) {
@@ -658,7 +709,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   private openSocket(): void {
-    if (this.destroyed || this.options.localOnly || typeof WebSocket === 'undefined') return;
+    if (this.destroyed || this.removed || this.options.localOnly || typeof WebSocket === 'undefined') return;
     const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const socket = new WebSocket(`${scheme}//${location.host}/ws`);
     this.socket = socket;
@@ -666,7 +717,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     this.subscribed = null;
     this.publish({ connection: 'connecting' });
     socket.onopen = () => {
-      if (this.socket !== socket || this.destroyed) return;
+      if (this.socket !== socket || this.destroyed || this.removed) return;
       this.send({
         type: 'join', documentId: this.options.manifest.id,
         accessToken: this.options.accessToken, ownerToken: this.options.ownerToken,
@@ -674,23 +725,28 @@ export class WorkspaceSession implements WorkspaceSessionApi {
       });
     };
     socket.onmessage = event => {
-      if (this.socket !== socket || typeof event.data !== 'string' || event.data.length > MAX_MESSAGE_BYTES) return;
+      if (this.socket !== socket || this.removed || typeof event.data !== 'string' || event.data.length > MAX_MESSAGE_BYTES) return;
       let message: ServerMessage;
       try { message = JSON.parse(event.data) as ServerMessage; } catch { return; }
       void this.handleMessage(message).catch(() => {
-        this.publish({ error: 'A collaboration update could not be applied.' });
+        if (!this.removed) this.publish({ error: 'A collaboration update could not be applied.' });
       });
     };
     socket.onerror = () => { /* onclose handles the connection transition */ };
-    socket.onclose = () => {
+    socket.onclose = event => {
       if (this.socket !== socket || this.destroyed) return;
+      if (event.code === REMOVED_CLOSE_CODE) {
+        this.markRemoved(event.reason);
+        return;
+      }
+      if (this.removed) return;
       this.socket = null;
       this.welcomed = false;
       this.subscribed = null;
       this.participants = [];
       this.previewByClient.clear();
       this.publishPreviews();
-      this.publish({ connection: 'offline', participants: [] });
+      this.publish({ connection: 'offline', participants: [], isAdmin: false });
       this.reconnectTimer = setTimeout(() => {
         this.reconnectTimer = null;
         this.openSocket();
@@ -700,14 +756,16 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   private async handleMessage(message: ServerMessage): Promise<void> {
-    if (this.destroyed || !message || typeof message !== 'object') return;
+    if (this.destroyed || this.removed || !message || typeof message !== 'object') return;
     switch (message.type) {
       case 'welcome':
+        if (message.clientId !== this.clientId) return;
         this.welcomed = true;
         this.reconnectDelay = 500;
         this.participants = this.visibleParticipants(message.participants);
         this.publish({
           connection: 'online', participants: this.participants,
+          isAdmin: message.participants.find(participant => participant.clientId === message.clientId)?.owner === true,
           ...(this.snapshot.saveState === 'error' ? {} : { error: null }),
         });
         this.sendState(INDEX_KEY, Y.encodeStateAsUpdate(this.index));
@@ -749,10 +807,49 @@ export class WorkspaceSession implements WorkspaceSessionApi {
       case 'error':
         this.publish({ error: message.message });
         break;
+      case 'removed':
+        this.markRemoved(message.message);
+        break;
     }
   }
 
+  kickParticipant(clientId: string): void {
+    if (this.removed || !this.welcomed || !this.snapshot.isAdmin || clientId === this.clientId) return;
+    const target = this.participants.find(participant => participant.clientId === clientId);
+    if (!target || target.owner) return;
+    this.send({ type: 'kick', clientId });
+  }
+
+  private markRemoved(message?: string): void {
+    if (this.removed || this.destroyed) return;
+    this.removed = true;
+    this.welcomed = false;
+    this.subscribed = null;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = null;
+    this.participants = [];
+    this.previewByClient.clear();
+    this.publishPreviews();
+    this.memoryStates.clear();
+    this.unsentUpdates.clear();
+    this.pendingText.clear();
+    for (const doc of this.bodies.values()) doc.destroy();
+    for (const doc of this.drawingBodies.values()) doc.destroy();
+    this.bodies.clear();
+    this.drawingBodies.clear();
+    this.publish({
+      connection: 'removed', isAdmin: false, participants: [], notes: [], drawings: [],
+      error: typeof message === 'string' && message.trim() ? message : 'You were removed from this document.',
+    });
+    const socket = this.socket;
+    this.socket = null;
+    if (socket?.readyState === WebSocket.OPEN) socket.close();
+  }
+
   private applyRemote(key: string, update: Uint8Array): void {
+    if (this.removed) return;
     if (key === INDEX_KEY) {
       Y.applyUpdate(this.index, update, 'remote');
       return;
@@ -765,13 +862,13 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     if (body) {
       Y.applyUpdate(body, update, 'remote');
     } else {
-      // The owner receives guest changes even for items outside the viewport.
-      // Keep the binary update for a delayed IndexedDB merge without opening a Y.Doc.
+      // Offscreen owner updates await IndexedDB; guests merge the binary state in RAM.
       this.queueWrite(key, update);
     }
   }
 
   private async sendStoredState(key: string): Promise<void> {
+    if (this.removed) return;
     const note = key.startsWith('note:');
     const drawing = key.startsWith('drawing:');
     if (key !== INDEX_KEY && !note && !drawing) return;
@@ -782,7 +879,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
     if (current) updates.push(Y.encodeStateAsUpdate(current));
     const saved = await this.readMergedState(key).catch(() => undefined);
     if (saved) updates.push(saved);
-    if (updates.length > 0) this.sendState(key, Y.mergeUpdates(updates));
+    if (!this.removed && updates.length > 0) this.sendState(key, Y.mergeUpdates(updates));
   }
 
   private isOpen(): boolean {
@@ -790,7 +887,7 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   private send(message: ClientMessage): boolean {
-    if (!this.isOpen()) return false;
+    if (this.removed || !this.isOpen()) return false;
     this.socket!.send(JSON.stringify(message));
     return true;
   }
@@ -800,8 +897,10 @@ export class WorkspaceSession implements WorkspaceSessionApi {
   }
 
   private sendUpdate(key: string, update: Uint8Array): void {
-    if (this.options.localOnly) return;
+    if (this.options.localOnly || this.removed) return;
     if (this.welcomed && this.send({ type: 'update', key, update: encode(update) })) return;
+    // The guest's index and loaded bodies are sent as full state on welcome.
+    if (!this.persistLocally) return;
     const pending = this.unsentUpdates.get(key) ?? [];
     pending.push(update);
     this.unsentUpdates.set(key, pending);

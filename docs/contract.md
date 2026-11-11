@@ -2,6 +2,11 @@
 
 The later [drawing and local-first contract](drawing-local-contract.md) supersedes upload-on-open and no-drawing restrictions below. Existing text/camera formats remain compatible.
 
+## Admin and guest persistence update
+The original PDF creator/sharer is the admin, authenticated by the existing owner capability. Display names, connection order, and client-provided participant IDs never confer admin privileges. Only the server-confirmed admin can remove a non-admin peer in the same room. A kick removes the current session and prevents automatic reconnection; this is not a permanent identity ban. Rejected/removed peers cannot continue sending updates while their sockets close. Active duplicate participant IDs must not displace another peer.
+
+Only local creators and authenticated owners retain PDF cache, camera, and Yjs data in IndexedDB. Guests keep document data in session RAM and never read/write document records in IndexedDB; their small display-name profile remains allowed. Guest lazy body unloading/reloading and reconnect must preserve unsent changes in RAM and continue forwarding edits to the owner for delayed local persistence. Guest status says Session only. HTTP page and link responses use private, no-store; owners use their explicit IndexedDB page cache. Safely remove legacy guest page caches/cameras when opening that document, guarded against owned records. Do not purge existing legacy annotation records, which may contain a sole copy of an edit.
+
 ## Scope and deployment
 One TypeScript monorepo, one long-running Node/Fastify process in one Docker container, existing VPS Traefik provides HTTPS. Root owns deploy/config; no subagent deploys. English minimal UI. Original PDF and derived pages live under DATA_DIR (persistent volume). Notes are NEVER stored on server disk; shared editing is ephemeral while clients are connected. Creator-owned history is only in browser storage, independent of display name and guest caches.
 

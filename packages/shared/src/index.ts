@@ -9,6 +9,7 @@ export const NOTE_FONT_STEP = 2;
 export const NOTE_PADDING = 2;
 export const NOTE_BORDER = 1;
 export const SAVE_IDLE_MS = 10_000;
+export const REMOVED_CLOSE_CODE = 4403;
 export const INDEX_KEY = 'index';
 export const noteKey = (id: string) => `note:${id}`;
 
@@ -53,7 +54,7 @@ export interface Participant { clientId: string; name: string; color: string; cu
 export type SaveState = 'saved' | 'pending' | 'saving' | 'error';
 export interface WorkspaceSnapshot {
   notes: TextNote[]; drawings: DrawingShape[]; drawingPreviews: RemoteDrawingPreview[];
-  participants: Participant[]; connection: 'connecting' | 'online' | 'offline' | 'local';
+  participants: Participant[]; isAdmin: boolean; connection: 'connecting' | 'online' | 'offline' | 'local' | 'removed';
   saveState: SaveState; error: string | null;
 }
 export interface SessionOptions {
@@ -71,16 +72,19 @@ export interface WorkspaceSessionApi {
   updateDrawing(id: string, patch: { x?: number; y?: number }): void;
   deleteDrawings(ids: string[]): void;
   sendDrawingPreview(preview: DrawingPreviewPacket | null): void;
+  kickParticipant(clientId: string): void;
   setCursor(cursor: CursorPosition | null): void; activity(): void; flush(): Promise<void>;
 }
 export type ClientMessage =
   | { type: 'join'; documentId: string; accessToken: string; ownerToken?: string; clientId: string; name: string }
+  | { type: 'kick'; clientId: string }
   | { type: 'subscribe'; keys: string[] }
   | { type: 'update'; key: string; update: string }
   | { type: 'state'; key: string; update: string }
   | { type: 'drawing-preview'; preview: DrawingPreviewPacket | null }
   | { type: 'cursor'; cursor: CursorPosition | null };
 export type ServerMessage =
+  | { type: 'removed'; message: string }
   | { type: 'welcome'; clientId: string; participants: Participant[] }
   | { type: 'participants'; participants: Participant[] }
   | { type: 'update'; key: string; update: string }

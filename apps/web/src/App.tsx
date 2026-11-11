@@ -4,7 +4,7 @@ import { getManifest } from './lib/api';
 import { importLocalFile, resolveExistingUpload, uploadLocalDocument } from './lib/localDocuments';
 import type { LocalPdfSource } from './lib/localPdf';
 import { buildViewUrl, parseSharedView, type SharedView } from './lib/shareLink';
-import { getLocalBlob, getLocalDocument, getOwnedProject, getProfile, listLocalDocuments, listOwnedProjects, saveOwnedProject, saveProfile, updateLocalManifest, type LocalDocumentRecord } from './lib/storage';
+import { clearGuestPageCache, getLocalBlob, getLocalDocument, getOwnedProject, getProfile, listLocalDocuments, listOwnedProjects, saveOwnedProject, saveProfile, updateLocalManifest, type LocalDocumentRecord } from './lib/storage';
 
 const Workspace = lazy(async () => ({ default: (await import('./components/Workspace')).Workspace }));
 
@@ -216,14 +216,16 @@ function DocumentRoute({ route, profile, onHome }: { route: Extract<Route, { kin
         if (!token) throw new Error('This link is missing its access token. Open the original share link.');
         if (!live) return;
         setAccessToken(token);
-        setOwned(project?.accessToken === token ? project : undefined);
+        const owner = project?.accessToken === token ? project : undefined;
+        setOwned(owner);
+        if (!owner) void clearGuestPageCache(route.documentId).catch(() => undefined);
         const poll = async () => {
           try {
             const result = await getManifest(route.documentId, token);
             if (!live) return;
             setManifest(result);
             if (result.status === 'processing') timer = window.setTimeout(() => void poll(), 1800);
-            else if (result.status === 'ready' && project) void saveOwnedProject({ ...project, title: result.title, lastOpenedAt: Date.now() });
+            else if (result.status === 'ready' && owner) void saveOwnedProject({ ...owner, title: result.title, lastOpenedAt: Date.now() });
           } catch (caught) { if (live) setError(errorText(caught)); }
         };
         await poll();

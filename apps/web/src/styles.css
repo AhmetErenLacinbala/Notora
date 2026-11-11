@@ -101,11 +101,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .workspace-presence { flex: 1; justify-content: flex-end; gap: 9px; }
 .participant-list { display: flex; align-items: center; min-width: 0; max-width: 245px; overflow: auto hidden; scrollbar-width: none; }
 .participant-list::-webkit-scrollbar { display: none; }
-.participant-pill { flex: none; display: inline-flex; align-items: center; gap: 5px; padding: 2px 5px 2px 2px; margin-right: 3px; border: 1px solid #ecebe5; border-radius: 30px; background: #fff; color: #6b6d67; max-width: 110px; }
+.participant-entry { flex: none; display: inline-flex; align-items: center; gap: 3px; margin-right: 3px; }
+.participant-pill { flex: none; display: inline-flex; align-items: center; gap: 5px; padding: 2px 5px 2px 2px; border: 1px solid #ecebe5; border-radius: 30px; background: #fff; color: #6b6d67; max-width: 150px; }
 .participant-pill:not(:disabled):hover { border-color: #c6beb6; }
 .participant-pill:disabled { opacity: .78; }
 .participant-avatar { flex: none; display: grid; place-items: center; width: 21px; height: 21px; border-radius: 50%; color: #fff; font-size: 10px; font-weight: 700; }
 .participant-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.participant-admin { flex: none; color: #9e4e38; font-size: 9px; font-weight: 650; }
+.participant-remove { flex: none; padding: 3px 5px; border: 1px solid #ecebe5; border-radius: 4px; background: #fff; color: #777970; font-size: 10px; }
+.participant-remove:hover { border-color: #c6beb6; color: #a34e39; }
 .connection-indicator { flex: none; width: 5px; height: 5px; border-radius: 50%; background: #8caa8c; }
 .connection-indicator.connecting { background: #d3b46c; }
 .connection-indicator.offline { background: #b8b5ad; }
@@ -182,7 +186,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
   .workspace-actions { gap: 6px; }
   .participant-name, .save-status, .share-separator { display: none; }
   .participant-pill { padding-right: 2px; }
-  .participant-list { max-width: 87px; }
+  .participant-list { max-width: 145px; }
 }
 @media (max-width: 610px) {
   .workspace-header { flex-wrap: wrap; height: auto; min-height: 91px; align-content: center; row-gap: 7px; padding-top: 8px; padding-bottom: 8px; }

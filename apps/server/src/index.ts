@@ -166,6 +166,7 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
 
   app.get<{ Params: { id: string; number: string }; Querystring: { v?: string } }>(
     '/api/documents/:id/pages/:number.pdf', async (request, reply) => {
+      reply.header('Cache-Control', 'private, no-store');
       const auth = authorized(request.params.id, request.headers.authorization);
       if (auth.status !== 200) return reply.code(auth.status).send({ error: 'Document unavailable' });
       const { manifest } = auth.record;
@@ -180,7 +181,6 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
       const etag = `"${manifest.version}-${number}"`;
       reply.header('Content-Type', 'application/pdf');
       reply.header('Content-Length', size);
-      reply.header('Cache-Control', 'private, max-age=31536000, immutable');
       reply.header('ETag', etag);
       if (request.headers['if-none-match'] === etag) return reply.code(304).send();
       return reply.send(createReadStream(path));
@@ -189,6 +189,7 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
 
   app.get<{ Params: { id: string; number: string } }>(
     '/api/documents/:id/pages/:number/links', async (request, reply) => {
+      reply.header('Cache-Control', 'private, no-store');
       const auth = authorized(request.params.id, request.headers.authorization);
       if (auth.status !== 200) return reply.code(auth.status).send({ error: 'Document unavailable' });
       const { manifest } = auth.record;
@@ -198,7 +199,7 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
       }
       try {
         const links = await store.pageLinks(manifest.id, manifest.version, number);
-        return reply.header('Cache-Control', 'private, max-age=31536000, immutable').send(links);
+        return reply.send(links);
       } catch { return reply.code(404).send({ error: 'Page unavailable' }); }
     },
   );

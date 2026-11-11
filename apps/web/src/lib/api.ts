@@ -238,12 +238,12 @@ export async function getManifest(id: string, token: string): Promise<DocumentMa
 }
 
 export async function getPageBytes(
-  id: string, version: string, page: number, token: string, signal?: AbortSignal,
+  id: string, version: string, page: number, token: string, signal?: AbortSignal, ownerToken?: string,
 ): Promise<Uint8Array> {
   signal?.throwIfAborted();
   if (!Number.isSafeInteger(page) || page < 1) throw new ApiError('Invalid page number.');
-  // Only one requested record is read; there is no all-pages memory cache.
-  const cached = await getCachedPage(id, version, page).catch(() => undefined);
+  // Guests use session memory only; owners read just the requested cached page.
+  const cached = ownerToken ? await getCachedPage(id, version, page).catch(() => undefined) : undefined;
   signal?.throwIfAborted();
   if (cached) return cached;
   const response = await requireOk(await fetch(
@@ -253,7 +253,7 @@ export async function getPageBytes(
   const bytes = new Uint8Array(await response.arrayBuffer());
   signal?.throwIfAborted();
   // A browser storage quota failure must not prevent the current page from rendering.
-  await saveCachedPage(id, version, page, bytes).catch(() => undefined);
+  if (ownerToken) await saveCachedPage(id, version, page, bytes).catch(() => undefined);
   signal?.throwIfAborted();
   return bytes;
 }

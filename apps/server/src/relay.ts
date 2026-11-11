@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { WebSocket, WebSocketServer } from 'ws';
 import * as Y from 'yjs';
 import type { ClientMessage, CubicBezier, CursorPosition, DrawingMeta, DrawingPreviewPacket, Participant, ServerMessage } from '../../../packages/shared/src/index.ts';
-import { INDEX_KEY, MAX_DRAWING_SEGMENTS, MAX_PREVIEW_POINTS } from '../../../packages/shared/src/index.ts';
+import { INDEX_KEY, MAX_DRAWING_SEGMENTS, MAX_PREVIEW_POINTS, REMOVED_CLOSE_CODE } from '../../../packages/shared/src/index.ts';
 import { decodeCurves } from '../../../packages/shared/src/drawing.ts';
 import type { DocumentStore } from './store.ts';
 
@@ -185,8 +185,8 @@ export function attachRelay(server: FastifyInstance, store: DocumentStore): void
 
   const removePeer = (peer: Peer) => {
     const room = peer.room;
-    clearPreview(peer);
     if (!room.peers.delete(peer)) return;
+    clearPreview(peer);
     if (room.peers.size === 0) {
       for (const doc of room.docs.values()) doc.destroy();
       room.docs.clear();
@@ -375,17 +375,10 @@ export function attachRelay(server: FastifyInstance, store: DocumentStore): void
     }
     room.pageCount = auth.record.manifest.pageCount;
     if (room.peers.size >= 32) { socket.close(1013, 'Room is full'); return null; }
-    for (const old of room.peers) {
-      if (old.id === message.clientId) {
-        room.peers.delete(old);
-        old.socket.close(1000, 'Reconnected');
-        break;
-      }
+    if ([...room.peers].some(peer => peer.id === message.clientId)) {
+      socket.close(1008, 'Client ID already in use');
+      return null;
     }
-    // A reconnect may have removed the last peer and cleared the old room.
-    room = rooms.get(message.documentId) ?? { peers: new Set(), docs: new Map(), acceptedBytes: 0, pageCount: auth.record.manifest.pageCount,
-      previewTokens: ROOM_PREVIEW_BURST, previewBudgetAt: Date.now() };
-    rooms.set(message.documentId, room);
     const peer: Peer = {
       socket, id: message.clientId, name: message.name.trim(), color: colorFor(message.clientId),
       owner: auth.owner, cursor: null, subscriptions: new Set(), room, lastCursorAt: 0,
@@ -400,6 +393,7 @@ export function attachRelay(server: FastifyInstance, store: DocumentStore): void
   }
 
   function handleMessage(peer: Peer, message: ClientMessage): void {
+    if (!peer.room.peers.has(peer)) return;
     if (message.type === 'subscribe') {
       if (!Array.isArray(message.keys) || message.keys.length > 1024 || !message.keys.every(key => typeof key === 'string' && KEY_PATTERN.test(key))) {
         send(peer.socket, { type: 'error', message: 'Invalid subscriptions' }); return;
@@ -418,6 +412,19 @@ export function attachRelay(server: FastifyInstance, store: DocumentStore): void
       for (const other of peer.room.peers) if (other !== peer) send(other.socket, broadcast);
     } else if (message.type === 'drawing-preview') {
       relayPreview(peer, message.preview);
+    } else if (message.type === 'kick') {
+      if (!peer.owner) { send(peer.socket, { type: 'error', message: 'Only the owner can remove participants' }); return; }
+      if (typeof message.clientId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(message.clientId)) {
+        send(peer.socket, { type: 'error', message: 'Invalid participant' }); return;
+      }
+      const target = [...peer.room.peers].find(other => other.id === message.clientId);
+      if (!target) { send(peer.socket, { type: 'error', message: 'Participant unavailable' }); return; }
+      if (target === peer || target.owner) {
+        send(peer.socket, { type: 'error', message: 'Cannot remove an owner' }); return;
+      }
+      send(target.socket, { type: 'removed', message: 'The document owner removed you from this session.' });
+      target.socket.close(REMOVED_CLOSE_CODE, 'Removed by owner');
+      removePeer(target);
     } else {
       send(peer.socket, { type: 'error', message: 'Invalid message' });
     }
@@ -430,6 +437,7 @@ export function attachRelay(server: FastifyInstance, store: DocumentStore): void
     let peer: Peer | null = null;
     const joinTimeout = setTimeout(() => { if (!peer) socket.close(1008, 'Join required'); }, 5_000);
     socket.on('message', raw => {
+      if (socket.readyState !== WebSocket.OPEN || peer && !peer.room.peers.has(peer)) return;
       let message: ClientMessage;
       try {
         message = JSON.parse(raw.toString()) as ClientMessage;

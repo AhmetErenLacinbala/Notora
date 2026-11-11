@@ -149,7 +149,7 @@ export function Workspace(props: WorkspaceProps) {
   return <WorkspaceContent key={identity} {...props} session={slot.session} />;
 }
 
-function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly, localPdf, onUpload, uploadState, uploadError, initialView, session }: WorkspaceProps & { session: WorkspaceSession }) {
+function WorkspaceContent({ manifest, accessToken, ownerToken, onHome, storageId, localOnly, localPdf, onUpload, uploadState, uploadError, initialView, session }: WorkspaceProps & { session: WorkspaceSession }) {
   const snapshot = useSyncExternalStore(useCallback(listener => session.subscribe(listener), [session]), useCallback(() => session.getSnapshot(), [session]));
   const pages = useMemo(() => pageLayout(manifest.pages), [manifest.pages]);
   const size = useMemo(() => contentSize(pages, snapshot.notes), [pages, snapshot.notes]);
@@ -197,6 +197,7 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
   const drawingsRef = useRef<DrawingShape[]>(snapshot.drawings);
   drawingsRef.current = snapshot.drawings;
   const cameraStorageId = storageId ?? manifest.id;
+  const canStoreCamera = !!localOnly || !!ownerToken;
 
   const locationUrl = useCallback((): string | null => {
     const viewport = viewportRef.current;
@@ -244,13 +245,13 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
   }, [writeLocation]);
 
   const saveCurrentCamera = useCallback(() => {
-    if (!cameraReady.current) return;
+    if (!cameraReady.current || !canStoreCamera) return;
     if (cameraTimer.current) window.clearTimeout(cameraTimer.current);
     cameraTimer.current = window.setTimeout(() => {
       cameraTimer.current = undefined;
-      void saveCamera(cameraStorageId, cameraRef.current);
+      if (canStoreCamera) void saveCamera(cameraStorageId, cameraRef.current);
     }, 450);
-  }, [cameraStorageId]);
+  }, [cameraStorageId, canStoreCamera]);
 
   const queuePointerCursor = useCallback((clientX: number, clientY: number) => {
     const element = viewportRef.current;
@@ -288,7 +289,7 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
       window.clearTimeout(locationTimer.current);
       locationTimer.current = undefined;
     }
-    void loadCamera(cameraStorageId).then(camera => {
+    void (canStoreCamera ? loadCamera(cameraStorageId) : Promise.resolve(undefined)).then(camera => {
       if (!live) return;
       const requestedZoom = Number.isFinite(initialView?.zoom) ? initialView!.zoom! : camera?.zoom ?? 1;
       const initialZoom = clamp(requestedZoom, MIN_ZOOM, MAX_ZOOM);
@@ -323,7 +324,7 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
       });
     });
     return () => { live = false; };
-  }, [cameraStorageId, pages, applyCamera, flushLocation, initialView?.page, initialView?.x, initialView?.y, initialView?.zoom]);
+  }, [cameraStorageId, canStoreCamera, pages, applyCamera, flushLocation, initialView?.page, initialView?.x, initialView?.y, initialView?.zoom]);
 
   useLayoutEffect(() => {
     const element = viewportRef.current;
@@ -366,10 +367,10 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
     if (cameraTimer.current) window.clearTimeout(cameraTimer.current);
     if (locationTimer.current !== undefined) window.clearTimeout(locationTimer.current);
     if (cursorFrame.current) cancelAnimationFrame(cursorFrame.current);
-    if (cameraReady.current) void saveCamera(cameraStorageId, cameraRef.current);
+    if (canStoreCamera && cameraReady.current) void saveCamera(cameraStorageId, cameraRef.current);
     if (activeDrawing.current) session.sendDrawingPreview(null);
     session.setCursor(null);
-  }, [cameraStorageId, session]);
+  }, [cameraStorageId, canStoreCamera, session]);
 
   const changeZoom = (next: number) => {
     const element = viewportRef.current;
@@ -938,11 +939,11 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
     setShareActionError(null);
     try {
       await session.flush();
-      await saveCamera(cameraStorageId, cameraRef.current);
+      if (canStoreCamera) await saveCamera(cameraStorageId, cameraRef.current);
       flushLocation();
       await onUpload(async () => {
         await session.flush();
-        await saveCamera(cameraStorageId, cameraRef.current);
+        if (canStoreCamera) await saveCamera(cameraStorageId, cameraRef.current);
         flushLocation();
       });
     } catch (error) {
@@ -956,7 +957,7 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
     pressCandidate.current = null;
     setTool(current => current === next ? null : next);
   };
-  const saveLabel = snapshot.saveState === 'saved' ? 'Saved locally' : snapshot.saveState === 'saving' ? 'Saving locally…' : snapshot.saveState === 'pending' ? 'Waiting to save…' : 'Save failed';
+  const saveLabel = !canStoreCamera ? 'Session only' : snapshot.saveState === 'saved' ? 'Saved locally' : snapshot.saveState === 'saving' ? 'Saving locally…' : snapshot.saveState === 'pending' ? 'Waiting to save…' : 'Save failed';
 
   const onWorkspaceKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     session.activity();
@@ -967,6 +968,8 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
     event.preventDefault();
     deleteSelection();
   };
+
+  if (snapshot.connection === 'removed') return <div className="document-wait workspace-removed"><main><h1>You were removed</h1><button type="button" className="secondary-button" onClick={onHome}>Back to home</button></main></div>;
 
   return <div className="workspace-shell" onPointerDownCapture={() => session.activity()} onKeyDown={onWorkspaceKeyDown}>
     <header className="workspace-header">
@@ -980,13 +983,26 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
         <div className="topbar-separator share-separator" />
         <div className="share-wrap"><button type="button" className="toolbar-button share-button" aria-expanded={shareOpen} onClick={() => { if (!shareOpen) flushLocation(); setShareOpen(value => !value); setShareCopied(false); setShareActionError(null); }}>Share</button>{shareOpen && <div className="share-popover"><strong>Share this PDF</strong>{localOnly ? <><p>Upload this file to create a link for collaborators.</p><button type="button" className="primary-button share-upload-button" disabled={!onUpload || shareBusy || !!uploadState} onClick={() => void uploadFromShare()}>Upload this file</button>{uploadState && <div className="share-upload-state" role="status">{uploadState.status === 'uploading' ? `Uploading… ${Math.round(uploadState.progress)}%` : 'Processing PDF…'}</div>}{(shareActionError || uploadError) && <p className="form-error share-error" role="alert">{shareActionError || uploadError}</p>}</> : <><p>Anyone with this link can read and write notes. The link opens at your current location.</p><div className="share-link-row"><input aria-label="Share link" readOnly value={shareUrl} placeholder={locationReady ? undefined : 'Locating…'} onFocus={event => event.currentTarget.select()} /><button type="button" disabled={!locationReady} onClick={() => void copyShare()}>{shareCopied ? 'Copied' : 'Copy'}</button></div></>}</div>}</div>
       </div>
-      <div className="workspace-presence"><div className="participant-list" aria-label="Participants">{snapshot.participants.map(participant => <button key={participant.clientId} type="button" className="participant-pill" title={participant.cursor ? `Jump to ${participant.name}` : participant.name} aria-label={participant.cursor ? `Jump to ${participant.name}` : participant.name} disabled={!participant.cursor} onClick={() => jumpToCursor(participant.cursor)}><span className="participant-avatar" style={{ backgroundColor: participant.color }}>{participant.name.slice(0, 1).toUpperCase()}</span><span className="participant-name">{participant.name}</span></button>)}</div><span className={`connection-indicator ${snapshot.connection}`} title={snapshot.connection} /><span className={`save-status ${snapshot.saveState}`} role="status" title={snapshot.error || undefined}>{saveLabel}</span></div>
+      <div className="workspace-presence">
+        <div className="participant-list" aria-label="Participants">{snapshot.participants.map(participant =>
+          <div className="participant-entry" key={participant.clientId}>
+            <button type="button" className="participant-pill" title={participant.cursor ? `Jump to ${participant.name}` : participant.name} aria-label={participant.cursor ? `Jump to ${participant.name}` : participant.name} disabled={!participant.cursor} onClick={() => jumpToCursor(participant.cursor)}>
+              <span className="participant-avatar" style={{ backgroundColor: participant.color }}>{participant.name.slice(0, 1).toUpperCase()}</span>
+              <span className="participant-name">{participant.name}</span>
+              {participant.owner && <span className="participant-admin">Admin</span>}
+            </button>
+            {snapshot.isAdmin && !participant.owner && <button type="button" className="participant-remove" aria-label={`Remove ${participant.name}`} onClick={() => session.kickParticipant(participant.clientId)}>Remove</button>}
+          </div>
+        )}</div>
+        <span className={`connection-indicator ${snapshot.connection}`} title={snapshot.connection} />
+        <span className={`save-status ${snapshot.saveState}`} role="status" title={snapshot.error || undefined}>{saveLabel}</span>
+      </div>
     </header>
     <div className="workspace-main">
       {outlineOpen && <aside className="outline-panel"><div className="outline-heading"><h2>Outline</h2><button type="button" aria-label="Close outline" onClick={() => setOutlineOpen(false)}>×</button></div>{manifest.outline.length ? <nav aria-label="PDF outline"><OutlineList items={manifest.outline} depth={0} onDestination={moveTo} /></nav> : <p className="outline-empty">No outline in this PDF.</p>}</aside>}
       <div className="viewer-wrap"><div className="viewer-viewport" ref={viewportRef} tabIndex={-1} onPointerDown={beginViewportPointer} onPointerEnter={setPointerCursor} onPointerMove={event => { moveViewportPointer(event); setPointerCursor(event); }} onPointerUp={endViewportPointer} onPointerCancel={endViewportPointer} onLostPointerCapture={endViewportPointer} onPointerLeave={clearPointerCursor} onDoubleClick={createAtPointer} onAuxClick={event => { if (event.button === 1) event.preventDefault(); }} aria-label={`${manifest.title} pages`}>
           <div className="pdf-stage" style={{ width: size.width, height: size.height, transform: `translate(${-camera.scrollLeft}px, ${-camera.scrollTop}px) scale(${zoom})` }}>
-            {renderedPages.map(page => <PdfPage key={`${manifest.version}:${page.number}`} page={page} documentId={manifest.id} version={manifest.version} accessToken={accessToken} localPdf={localPdf} zoom={zoom} active={nearbyPageNumbers.has(page.number)} retain={desktop} onReady={onPageReady} onDestination={moveTo} />)}
+            {renderedPages.map(page => <PdfPage key={`${manifest.version}:${page.number}`} page={page} documentId={manifest.id} version={manifest.version} accessToken={accessToken} ownerToken={ownerToken} localPdf={localPdf} zoom={zoom} active={nearbyPageNumbers.has(page.number)} retain={desktop} onReady={onPageReady} onDestination={moveTo} />)}
             <div className="notes-layer" aria-label="Notes">{visibleNotes.map(note => <NoteEditor
               key={note.id}
               note={note}

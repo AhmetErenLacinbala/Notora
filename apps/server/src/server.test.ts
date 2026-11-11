@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import * as Y from 'yjs';
 import type { FastifyInstance } from 'fastify';
-import { MAX_UPLOAD_CHUNK_BYTES, type ServerMessage, type UploadResult, type UploadSession } from '../../../packages/shared/src/index.ts';
+import { MAX_UPLOAD_CHUNK_BYTES, REMOVED_CLOSE_CODE, type ServerMessage, type UploadResult, type UploadSession } from '../../../packages/shared/src/index.ts';
 import { createServer } from './index.ts';
 import type { PdfTools } from './pdf.ts';
 
@@ -77,11 +77,13 @@ function uploadHeaders(session: UploadSession, offset = 0) {
 
 class Messages {
   readonly socket: WebSocket;
+  readonly closed: Promise<{ code: number; reason: string }>;
   readonly received: ServerMessage[] = [];
   private waiters: Array<() => void> = [];
 
   constructor(url: string) {
     this.socket = new WebSocket(url);
+    this.closed = new Promise(resolve => this.socket.once('close', (code, reason) => resolve({ code, reason: reason.toString() })));
     this.socket.on('message', raw => {
       this.received.push(JSON.parse(raw.toString()) as ServerMessage);
       for (const wake of this.waiters.splice(0)) wake();
@@ -112,6 +114,13 @@ class Messages {
   }
 
   close() { this.socket.terminate(); }
+}
+
+async function connect(url: string, tokens: UploadResult, clientId: string, name: string, ownerToken?: string): Promise<Messages> {
+  const client = new Messages(url);
+  await client.open();
+  client.send({ type: 'join', documentId: tokens.documentId, accessToken: tokens.accessToken, ownerToken, clientId, name });
+  return client;
 }
 
 describe('Notora server', () => {
@@ -149,12 +158,16 @@ describe('Notora server', () => {
     expect((await app.inject({ method: 'GET', url: `/api/documents/${tokens.documentId}/pages/1/links` })).statusCode).toBe(401);
     const page = await app.inject({ method: 'GET', url: path, headers });
     expect(page.statusCode).toBe(200);
+    expect(page.headers['cache-control']).toBe('private, no-store');
     expect(page.headers['content-type']).toContain('application/pdf');
     expect(page.rawPayload.equals(pdf)).toBe(true);
-    expect((await app.inject({ method: 'GET', url: path, headers: { ...headers, 'if-none-match': String(page.headers.etag) } })).statusCode).toBe(304);
+    const unchanged = await app.inject({ method: 'GET', url: path, headers: { ...headers, 'if-none-match': String(page.headers.etag) } });
+    expect(unchanged.statusCode).toBe(304);
+    expect(unchanged.headers['cache-control']).toBe('private, no-store');
     expect((await app.inject({ method: 'GET', url: `/api/documents/${tokens.documentId}/pages/3.pdf`, headers })).statusCode).toBe(404);
     expect((await app.inject({ method: 'GET', url: `/api/documents/${tokens.documentId}/pages/1.pdf?v=wrong`, headers })).statusCode).toBe(404);
     const links = await app.inject({ method: 'GET', url: `/api/documents/${tokens.documentId}/pages/1/links`, headers });
+    expect(links.headers['cache-control']).toBe('private, no-store');
     expect(links.json()).toEqual([{ rect: [10, 20, 30, 40], destination: { page: 2 } }]);
     expect((await app.inject({ method: 'GET', url: '/api/missing' })).json()).toEqual({ error: 'Not found' });
     expect((await app.inject({ method: 'GET', url: '/healthz' })).json()).toMatchObject({ status: 'ok' });
@@ -390,5 +403,111 @@ describe('Notora server', () => {
     await late.next(message => message.type === 'welcome');
     late.send({ type: 'subscribe', keys: ['note:one'] });
     expect((await late.next(message => message.type === 'need-state' && message.keys.includes('note:one'))).type).toBe('need-state');
+  });
+
+  it('grants removal only to a verified owner, regardless of arrival order, name, or client ID', async () => {
+    const { app, store } = await setup();
+    const tokens = await upload(app);
+    await store.waitForIdle();
+    const address = await app.listen({ host: '127.0.0.1', port: 0 });
+    const url = `${address.replace(/^http/, 'ws')}/ws`;
+    const clients: Messages[] = [];
+    resources.push(async () => { for (const client of clients) client.close(); });
+
+    const firstGuest = await connect(url, tokens, 'first', 'Owner');
+    clients.push(firstGuest);
+    expect(await firstGuest.next(message => message.type === 'welcome')).toMatchObject({
+      participants: [{ clientId: 'first', owner: false }],
+    });
+    firstGuest.send({ type: 'kick', clientId: 'first', owner: true, ownerToken: tokens.ownerToken });
+    expect(await firstGuest.next(message => message.type === 'error')).toMatchObject({ message: 'Only the owner can remove participants' });
+
+    const owner = await connect(url, tokens, 'owner', 'Creator', tokens.ownerToken);
+    clients.push(owner);
+    expect(await owner.next(message => message.type === 'welcome')).toMatchObject({
+      participants: expect.arrayContaining([{ clientId: 'owner', name: 'Creator', owner: true, color: expect.any(String), cursor: null }]),
+    });
+    firstGuest.send({ type: 'kick', clientId: 'owner', owner: true, ownerToken: tokens.ownerToken });
+    expect(await firstGuest.next(message => message.type === 'error')).toMatchObject({ message: 'Only the owner can remove participants' });
+    expect(owner.socket.readyState).toBe(WebSocket.OPEN);
+
+    const forgedOwner = await connect(url, tokens, 'forged', 'Creator', 'wrong-owner-token');
+    clients.push(forgedOwner);
+    expect((await forgedOwner.closed).code).toBe(1008);
+    expect(forgedOwner.received.some(message => message.type === 'welcome')).toBe(false);
+
+    const duplicateId = await connect(url, tokens, 'owner', 'Impersonator');
+    clients.push(duplicateId);
+    expect(await duplicateId.closed).toMatchObject({ code: 1008, reason: 'Client ID already in use' });
+    expect(owner.socket.readyState).toBe(WebSocket.OPEN);
+
+    const secondOwner = await connect(url, tokens, 'second-owner', 'Another creator tab', tokens.ownerToken);
+    clients.push(secondOwner);
+    expect(await secondOwner.next(message => message.type === 'welcome')).toMatchObject({
+      participants: expect.arrayContaining([{ clientId: 'second-owner', owner: true, color: expect.any(String), cursor: null, name: 'Another creator tab' }]),
+    });
+    owner.send({ type: 'kick', clientId: 'owner' });
+    expect(await owner.next(message => message.type === 'error')).toMatchObject({ message: 'Cannot remove an owner' });
+    owner.send({ type: 'kick', clientId: 'second-owner' });
+    expect(await owner.next(message => message.type === 'error')).toMatchObject({ message: 'Cannot remove an owner' });
+    expect(secondOwner.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it('removes only a guest in the same room, clears their preview, and ignores late frames', async () => {
+    const { app, store } = await setup();
+    const tokens = await upload(app);
+    const otherTokens = await upload(app);
+    await store.waitForIdle();
+    const address = await app.listen({ host: '127.0.0.1', port: 0 });
+    const url = `${address.replace(/^http/, 'ws')}/ws`;
+    const clients: Messages[] = [];
+    resources.push(async () => { for (const client of clients) client.close(); });
+
+    const owner = await connect(url, tokens, 'owner', 'Owner', tokens.ownerToken);
+    clients.push(owner);
+    await owner.next(message => message.type === 'welcome');
+    const guest = await connect(url, tokens, 'guest', 'Guest');
+    clients.push(guest);
+    await guest.next(message => message.type === 'welcome');
+    const otherRoomGuest = await connect(url, otherTokens, 'other-room', 'Other room guest');
+    clients.push(otherRoomGuest);
+    await otherRoomGuest.next(message => message.type === 'welcome');
+
+    owner.send({ type: 'kick', clientId: 'other-room' });
+    expect(await owner.next(message => message.type === 'error')).toMatchObject({ message: 'Participant unavailable' });
+    expect(otherRoomGuest.socket.readyState).toBe(WebSocket.OPEN);
+
+    guest.send({ type: 'drawing-preview', preview: {
+      id: 'pending', kind: 'stroke', anchorPage: 1, x: 0, y: 0, width: 2, seq: 0,
+      points: [{ x: 0, y: 0 }],
+    } });
+    expect(await owner.next(message => message.type === 'drawing-preview' && message.clientId === 'guest' && message.preview !== null))
+      .toMatchObject({ clientId: 'guest' });
+    owner.received.length = 0;
+
+    let sentAfterRemoval = false;
+    guest.socket.on('message', raw => {
+      if ((JSON.parse(raw.toString()) as ServerMessage).type !== 'removed' || guest.socket.readyState !== WebSocket.OPEN) return;
+      sentAfterRemoval = true;
+      guest.send({ type: 'cursor', cursor: { x: 999, y: 999 } });
+      const note = new Y.Doc();
+      note.getText('text').insert(0, 'late edit');
+      guest.send({ type: 'update', key: 'note:late', update: Buffer.from(Y.encodeStateAsUpdate(note)).toString('base64') });
+    });
+    owner.send({ type: 'kick', clientId: 'guest' });
+    expect(await guest.next(message => message.type === 'removed')).toMatchObject({ message: expect.stringContaining('removed') });
+    expect(await guest.closed).toMatchObject({ code: REMOVED_CLOSE_CODE, reason: 'Removed by owner' });
+    expect(sentAfterRemoval).toBe(true);
+    expect(await owner.next(message => message.type === 'drawing-preview' && message.clientId === 'guest' && message.preview === null))
+      .toMatchObject({ clientId: 'guest', preview: null });
+    const remaining = await owner.next(message => message.type === 'participants' && !message.participants.some(participant => participant.clientId === 'guest'));
+    expect(remaining).toMatchObject({ participants: expect.arrayContaining([{ clientId: 'owner', owner: true, color: expect.any(String), cursor: null, name: 'Owner' }]) });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(owner.received.some(message => message.type === 'cursor' && message.clientId === 'guest' && message.cursor?.x === 999)).toBe(false);
+    expect(owner.received.some(message => message.type === 'update' && message.key === 'note:late')).toBe(false);
+
+    const rejoined = await connect(url, tokens, 'guest', 'Guest');
+    clients.push(rejoined);
+    expect((await rejoined.next(message => message.type === 'welcome')).type).toBe('welcome');
   });
 });

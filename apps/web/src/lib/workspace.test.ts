@@ -3,7 +3,7 @@ import Fastify from 'fastify';
 import * as Y from 'yjs';
 import { WebSocket as RealWebSocket } from 'ws';
 import {
-  noteFontSize, type ClientMessage, type CubicBezier, type DocumentManifest, type DrawingMeta, type NoteMeta,
+  noteFontSize, REMOVED_CLOSE_CODE, type ClientMessage, type CubicBezier, type DocumentManifest, type DrawingMeta, type NoteMeta,
   type ServerMessage, type SessionOptions,
 } from '../../../../packages/shared/src/index';
 import { decodeCurves, drawingBounds, encodeCurves } from './drawingGeometry';
@@ -37,14 +37,14 @@ class Socket {
   sent: ClientMessage[] = [];
   onopen: (() => void) | null = null;
   onmessage: ((event: { data: string }) => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((event: { code: number; reason: string }) => void) | null = null;
   onerror: (() => void) | null = null;
 
   constructor(readonly url: string) { Socket.instances.push(this); }
   open(): void { this.readyState = Socket.OPEN; this.onopen?.(); }
   receive(message: ServerMessage): void { this.onmessage?.({ data: JSON.stringify(message) }); }
   send(serialized: string): void { this.sent.push(JSON.parse(serialized) as ClientMessage); }
-  close(): void { this.readyState = 3; this.onclose?.(); }
+  close(code = 1000, reason = ''): void { this.readyState = 3; this.onclose?.({ code, reason }); }
 }
 
 const manifest: DocumentManifest = {
@@ -71,7 +71,10 @@ async function online(session: WorkspaceSession): Promise<Socket> {
   const socket = Socket.instances.at(-1)!;
   socket.open();
   expect(socket.sent[0]?.type).toBe('join');
-  socket.receive({ type: 'welcome', clientId: 'client', participants: [] });
+  const join = socket.sent[0] as Extract<ClientMessage, { type: 'join' }>;
+  socket.receive({ type: 'welcome', clientId: join.clientId, participants: [
+    { clientId: join.clientId, name: join.name, color: '#123456', cursor: null, owner: Boolean(join.ownerToken) },
+  ] });
   return socket;
 }
 
@@ -144,6 +147,95 @@ describe('WorkspaceSession', () => {
     expect(restored.getText('text').toString()).toBe('guest edit');
     await owner.destroy();
     await guest.destroy();
+  });
+
+  it('never reads or writes guest document storage, including old records, idle, flush and destroy', async () => {
+    const oldIndex = new Y.Doc();
+    oldIndex.getMap<NoteMeta>('notes').set('legacy-guest-note', {
+      id: 'legacy-guest-note', anchorPage: 1, x: 10, y: 10, lineCount: 1,
+    });
+    persistence.states.set('legacy-guest:index', Y.encodeStateAsUpdate(oldIndex));
+    const session = new WorkspaceSession({ ...options(), storageId: 'legacy-guest' });
+    const socket = await online(session);
+    expect(session.getSnapshot().notes).toEqual([]);
+    expect(vi.mocked(getYState)).not.toHaveBeenCalled();
+
+    const id = session.createNote(1, 20, 20);
+    session.setNoteText(id, 'guest edit');
+    session.createDrawing(drawingMeta(20), drawingCurves);
+    const remoteIndex = new Y.Doc();
+    remoteIndex.getMap<NoteMeta>('notes').set('offscreen', {
+      id: 'offscreen', anchorPage: 1, x: 10, y: 700, lineCount: 1,
+    });
+    remoteIndex.getMap<DrawingMeta>('drawings').set('remote-drawing', {
+      ...drawingMeta(720), id: 'remote-drawing',
+    });
+    const remoteBody = new Y.Doc();
+    remoteBody.getText('text').insert(0, 'remote RAM text');
+    const remoteDrawing = new Y.Doc();
+    remoteDrawing.transact(() => {
+      remoteDrawing.getMap('geometry').set('version', 1);
+      remoteDrawing.getMap('geometry').set('curves', encodeCurves(drawingCurves));
+    });
+    socket.receive({ type: 'update', key: 'index', update: Buffer.from(Y.encodeStateAsUpdate(remoteIndex)).toString('base64') });
+    socket.receive({ type: 'update', key: 'note:offscreen', update: Buffer.from(Y.encodeStateAsUpdate(remoteBody)).toString('base64') });
+    socket.receive({ type: 'update', key: 'drawing:remote-drawing', update: Buffer.from(Y.encodeStateAsUpdate(remoteDrawing)).toString('base64') });
+    expect(session.getSnapshot().notes.find(note => note.id === 'offscreen')?.text).toBeNull();
+    expect(session.getSnapshot().drawings.find(drawing => drawing.id === 'remote-drawing')?.curves).toBeNull();
+    socket.receive({ type: 'need-state', keys: ['note:offscreen'] });
+    await vi.waitFor(() => expect(socket.sent.some(message => message.type === 'state' && message.key === 'note:offscreen')).toBe(true));
+    session.setVisibleRange(700, 850);
+    await vi.waitFor(() => expect(session.getSnapshot().notes.find(note => note.id === 'offscreen')?.text).toBe('remote RAM text'));
+    await vi.waitFor(() => expect(session.getSnapshot().drawings.find(drawing => drawing.id === 'remote-drawing')?.curves).toEqual(drawingCurves));
+
+    vi.useFakeTimers();
+    session.activity();
+    await vi.advanceTimersByTimeAsync(20_000);
+    await session.flush();
+    await session.destroy();
+    expect(vi.mocked(getYState)).not.toHaveBeenCalled();
+    expect(vi.mocked(saveYUpdates)).not.toHaveBeenCalled();
+    expect(persistence.states.has('legacy-guest:index')).toBe(true);
+    expect(persistence.states.has(`legacy-guest:note:${id}`)).toBe(false);
+  });
+
+  it('keeps guest offscreen bodies and offline edits in RAM through reconnect', async () => {
+    const session = new WorkspaceSession(options());
+    const first = await online(session);
+    const remoteIndex = new Y.Doc();
+    remoteIndex.getMap<NoteMeta>('notes').set('remote-note', {
+      id: 'remote-note', anchorPage: 1, x: 10, y: 700, lineCount: 1,
+    });
+    const remoteBody = new Y.Doc();
+    remoteBody.getText('text').insert(0, 'offscreen state');
+    first.receive({ type: 'update', key: 'index', update: Buffer.from(Y.encodeStateAsUpdate(remoteIndex)).toString('base64') });
+    first.receive({ type: 'update', key: 'note:remote-note', update: Buffer.from(Y.encodeStateAsUpdate(remoteBody)).toString('base64') });
+    vi.useFakeTimers();
+    first.close();
+    const ownId = session.createNote(1, 25, 25);
+    session.setNoteText(ownId, 'offline edit');
+    await vi.advanceTimersByTimeAsync(500);
+    const second = Socket.instances.at(-1)!;
+    second.open();
+    const join = second.sent[0] as Extract<ClientMessage, { type: 'join' }>;
+    second.receive({ type: 'welcome', clientId: join.clientId, participants: [
+      { clientId: join.clientId, name: 'Guest', color: '#123456', cursor: null, owner: false },
+    ] });
+    expect(second.sent.some(message => message.type === 'state' && message.key === 'index')).toBe(true);
+    expect(second.sent.some(message => message.type === 'state' && message.key === `note:${ownId}`)).toBe(true);
+    second.receive({ type: 'need-state', keys: ['note:remote-note'] });
+    await vi.advanceTimersByTimeAsync(1);
+    const state = second.sent.findLast(message => message.type === 'state' && message.key === 'note:remote-note') as
+      Extract<ClientMessage, { type: 'state' }>;
+    const restored = new Y.Doc();
+    Y.applyUpdate(restored, Uint8Array.from(atob(state.update), char => char.charCodeAt(0)));
+    expect(restored.getText('text').toString()).toBe('offscreen state');
+    session.setVisibleRange(700, 850);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(session.getSnapshot().notes.find(note => note.id === 'remote-note')?.text).toBe('offscreen state');
+    expect(vi.mocked(getYState)).not.toHaveBeenCalled();
+    expect(vi.mocked(saveYUpdates)).not.toHaveBeenCalled();
+    await session.destroy();
   });
 
   it('reads an old note without font metadata, then saves font and position without loading offscreen text', async () => {
@@ -351,6 +443,84 @@ describe('WorkspaceSession', () => {
     await session.destroy();
   });
 
+  it('grants kick controls only from the server-confirmed own participant', async () => {
+    const guest = new WorkspaceSession({ ...options(), profile: { id: 'imposter', name: 'Owner' } });
+    const guestSocket = await online(guest);
+    const guestId = (guestSocket.sent[0] as Extract<ClientMessage, { type: 'join' }>).clientId;
+    guestSocket.receive({ type: 'participants', participants: [
+      { clientId: guestId, name: 'Owner', color: '#123456', cursor: null, owner: false },
+      { clientId: 'real-owner', name: 'Owner', color: '#abcdef', cursor: null, owner: true },
+    ] });
+    expect(guest.getSnapshot().isAdmin).toBe(false);
+    guest.kickParticipant('real-owner');
+    expect(guestSocket.sent.some(message => message.type === 'kick')).toBe(false);
+
+    const admin = new WorkspaceSession(options(true));
+    const adminSocket = await online(admin);
+    const adminId = (adminSocket.sent[0] as Extract<ClientMessage, { type: 'join' }>).clientId;
+    expect(admin.getSnapshot().isAdmin).toBe(true);
+    adminSocket.receive({ type: 'participants', participants: [
+      { clientId: 'first-guest', name: 'Owner', color: '#abcdef', cursor: null, owner: false },
+      { clientId: adminId, name: 'Owner', color: '#123456', cursor: null, owner: true },
+      { clientId: 'other-owner', name: 'Creator', color: '#abcdef', cursor: null, owner: true },
+    ] });
+    admin.kickParticipant(adminId);
+    admin.kickParticipant('other-owner');
+    admin.kickParticipant('unknown');
+    expect(adminSocket.sent.some(message => message.type === 'kick')).toBe(false);
+    admin.kickParticipant('first-guest');
+    expect(adminSocket.sent.filter(message => message.type === 'kick')).toEqual([
+      { type: 'kick', clientId: 'first-guest' },
+    ]);
+    await admin.destroy();
+    await guest.destroy();
+  });
+
+  it('treats a removed frame as terminal and ignores late state and edit attempts', async () => {
+    const session = new WorkspaceSession(options());
+    const socket = await online(session);
+    const ownId = session.createNote(1, 20, 20);
+    session.setNoteText(ownId, 'before removal');
+    socket.receive({ type: 'participants', participants: [
+      { clientId: 'remote', name: 'Remote', color: '#abcdef', cursor: null, owner: true },
+    ] });
+    socket.receive({ type: 'drawing-preview', clientId: 'remote', preview: {
+      id: 'pending-stroke', kind: 'stroke', anchorPage: 1, x: 20, y: 20, width: 2,
+      seq: 0, points: [{ x: 0, y: 0 }],
+    } });
+    expect(session.getSnapshot().drawingPreviews).toHaveLength(1);
+    const before = socket.sent.length;
+    socket.receive({ type: 'need-state', keys: ['index'] });
+    socket.receive({ type: 'removed', message: 'The creator removed you.' });
+    await Promise.resolve();
+    expect(session.getSnapshot()).toMatchObject({
+      connection: 'removed', isAdmin: false, participants: [], drawingPreviews: [],
+      notes: [], drawings: [], error: 'The creator removed you.',
+    });
+    socket.receive({ type: 'welcome', clientId: 'late', participants: [] });
+    socket.receive({ type: 'update', key: 'index', update: Buffer.from(Y.encodeStateAsUpdate(new Y.Doc())).toString('base64') });
+    session.setNoteText(ownId, 'after removal');
+    session.setCursor({ x: 1, y: 1 });
+    session.sendDrawingPreview(null);
+    expect(() => session.createNote(1, 30, 30)).toThrow('removed');
+    expect(socket.sent).toHaveLength(before);
+    vi.useFakeTimers();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(Socket.instances).toHaveLength(1);
+    await session.destroy();
+  });
+
+  it('treats a removal close code as terminal without reconnecting', async () => {
+    const session = new WorkspaceSession(options());
+    const socket = await online(session);
+    vi.useFakeTimers();
+    socket.close(REMOVED_CLOSE_CODE, 'Access revoked.');
+    expect(session.getSnapshot()).toMatchObject({ connection: 'removed', error: 'Access revoked.' });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(Socket.instances).toHaveLength(1);
+    await session.destroy();
+  });
+
   it('keeps a focused note subscribed while its page scrolls out of range', async () => {
     const session = new WorkspaceSession(options(true));
     const socket = await online(session);
@@ -381,7 +551,8 @@ describe('WorkspaceSession', () => {
     const secondSocket = Socket.instances.at(-1)!;
     expect(secondSocket).not.toBe(firstSocket);
     secondSocket.open();
-    secondSocket.receive({ type: 'welcome', clientId: 'client', participants: [] });
+    const secondJoin = secondSocket.sent[0] as Extract<ClientMessage, { type: 'join' }>;
+    secondSocket.receive({ type: 'welcome', clientId: secondJoin.clientId, participants: [] });
     const beforeRequest = secondSocket.sent.filter(message => message.type === 'state' && message.key === `note:${id}`).length;
     secondSocket.receive({ type: 'need-state', keys: [`note:${id}`] });
     await vi.advanceTimersByTimeAsync(20);
@@ -442,52 +613,53 @@ describe('WorkspaceSession', () => {
     await reopened.destroy();
   });
 
-  it('restores a shared guest’s saved strokes after reload and relay restart, then serves them to a fresh guest', async () => {
+  it('restores guest strokes from the creator after a relay restart without a guest disk copy', async () => {
     vi.stubGlobal('WebSocket', RealWebSocket);
     const store = {
       authorize(documentId: string, accessToken: string, ownerToken?: string) {
-        if (documentId !== 'document' || accessToken !== 'access' || ownerToken) return null;
-        return { record: { manifest }, owner: false };
+        if (documentId !== 'document' || accessToken !== 'access' || ownerToken && ownerToken !== 'owner') return null;
+        return { record: { manifest }, owner: ownerToken === 'owner' };
       },
     } as unknown as DocumentStore;
     const firstRelay = Fastify();
     attachRelay(firstRelay, store);
     let secondRelay: ReturnType<typeof Fastify> | undefined;
-    let original: WorkspaceSession | undefined;
-    let sameRelayReload: WorkspaceSession | undefined;
-    let reopened: WorkspaceSession | undefined;
+    let originalOwner: WorkspaceSession | undefined;
+    let originalGuest: WorkspaceSession | undefined;
+    let reopenedOwner: WorkspaceSession | undefined;
     let freshGuest: WorkspaceSession | undefined;
     try {
       const firstAddress = await firstRelay.listen({ host: '127.0.0.1', port: 0 });
       vi.stubGlobal('location', { protocol: 'http:', host: new URL(firstAddress).host });
-      original = new WorkspaceSession(options());
-      original.setVisibleRange(0, 900);
-      original.connect();
-      await vi.waitFor(() => expect(original!.getSnapshot().connection).toBe('online'));
-      const ids = [20, 30, 40].map(y => original!.createDrawing(drawingMeta(y), drawingCurves));
-      await original.flush();
-      for (const id of ids) expect(persistence.states.has(`document:drawing:${id}`)).toBe(true);
-      await original.destroy();
-
-      sameRelayReload = new WorkspaceSession(options());
-      sameRelayReload.setVisibleRange(0, 900);
-      sameRelayReload.connect();
-      await vi.waitFor(() => expect(sameRelayReload!.getSnapshot().connection).toBe('online'));
-      await vi.waitFor(() => expect(sameRelayReload!.getSnapshot().drawings.map(drawing => drawing.id)).toEqual(ids));
-      await vi.waitFor(() => expect(sameRelayReload!.getSnapshot().drawings.every(drawing => drawing.curves !== null)).toBe(true));
-      await sameRelayReload.destroy();
+      originalOwner = new WorkspaceSession(options(true));
+      originalOwner.setVisibleRange(0, 100);
+      originalOwner.connect();
+      await vi.waitFor(() => expect(originalOwner!.getSnapshot().connection).toBe('online'));
+      originalGuest = new WorkspaceSession(options());
+      originalGuest.setVisibleRange(0, 900);
+      originalGuest.connect();
+      await vi.waitFor(() => expect(originalGuest!.getSnapshot().connection).toBe('online'));
+      const ids = [700, 720, 740].map(y => originalGuest!.createDrawing(drawingMeta(y), drawingCurves));
+      await vi.waitFor(async () => {
+        await originalOwner!.flush();
+        for (const id of ids) expect(persistence.states.has(`document:drawing:${id}`)).toBe(true);
+      });
+      expect(originalOwner.getSnapshot().drawings.every(drawing => drawing.curves === null)).toBe(true);
+      await originalGuest.flush();
+      await originalGuest.destroy();
+      await originalOwner.destroy();
       await firstRelay.close();
 
       secondRelay = Fastify();
       attachRelay(secondRelay, store);
       const secondAddress = await secondRelay.listen({ host: '127.0.0.1', port: 0 });
       vi.stubGlobal('location', { protocol: 'http:', host: new URL(secondAddress).host });
-      reopened = new WorkspaceSession(options());
-      reopened.setVisibleRange(0, 900);
-      reopened.connect();
-      await vi.waitFor(() => expect(reopened!.getSnapshot().connection).toBe('online'));
-      await vi.waitFor(() => expect(reopened!.getSnapshot().drawings.map(drawing => drawing.id)).toEqual(ids));
-      await vi.waitFor(() => expect(reopened!.getSnapshot().drawings.every(drawing => drawing.curves !== null)).toBe(true));
+      reopenedOwner = new WorkspaceSession(options(true));
+      reopenedOwner.setVisibleRange(0, 900);
+      reopenedOwner.connect();
+      await vi.waitFor(() => expect(reopenedOwner!.getSnapshot().connection).toBe('online'));
+      await vi.waitFor(() => expect(reopenedOwner!.getSnapshot().drawings.map(drawing => drawing.id)).toEqual(ids));
+      await vi.waitFor(() => expect(reopenedOwner!.getSnapshot().drawings.every(drawing => drawing.curves !== null)).toBe(true));
 
       freshGuest = new WorkspaceSession({ ...options(), storageId: 'fresh-guest' });
       freshGuest.setVisibleRange(0, 900);
@@ -496,9 +668,9 @@ describe('WorkspaceSession', () => {
       await vi.waitFor(() => expect(freshGuest!.getSnapshot().drawings.every(drawing => drawing.curves !== null)).toBe(true));
     } finally {
       await freshGuest?.destroy();
-      await reopened?.destroy();
-      await sameRelayReload?.destroy();
-      await original?.destroy();
+      await reopenedOwner?.destroy();
+      await originalGuest?.destroy();
+      await originalOwner?.destroy();
       if (secondRelay) await secondRelay.close();
       else await firstRelay.close();
     }
@@ -533,7 +705,7 @@ describe('WorkspaceSession', () => {
     await vi.advanceTimersByTimeAsync(500);
     const reconnected = Socket.instances.at(-1)!;
     reconnected.open();
-    reconnected.receive({ type: 'welcome', clientId: 'client', participants: [] });
+    reconnected.receive({ type: 'welcome', clientId: (reconnected.sent[0] as Extract<ClientMessage, { type: 'join' }>).clientId, participants: [] });
     expect(reconnected.sent.some(message => message.type === 'state' && message.key === `drawing:${id}`)).toBe(false);
     await owner.flush();
     await owner.destroy();
@@ -557,7 +729,7 @@ describe('WorkspaceSession', () => {
     await vi.advanceTimersByTimeAsync(500);
     const second = Socket.instances.at(-1)!;
     second.open();
-    second.receive({ type: 'welcome', clientId: 'client', participants: [] });
+    second.receive({ type: 'welcome', clientId: (second.sent[0] as Extract<ClientMessage, { type: 'join' }>).clientId, participants: [] });
     expect(second.sent.some(message => message.type === 'state' && message.key === `drawing:${id}`)).toBe(true);
     const prior = second.sent.filter(message => message.type === 'state' && message.key === `drawing:${id}`).length;
     second.receive({ type: 'need-state', keys: [`drawing:${id}`] });
