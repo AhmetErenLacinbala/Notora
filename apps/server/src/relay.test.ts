@@ -61,6 +61,56 @@ const preview: DrawingPreviewPacket = {
 const base64 = (doc: Y.Doc) => Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64');
 
 describe('drawing relay', () => {
+  it('forwards consecutive completed strokes in order, including one across a page boundary', async () => {
+    const app = Fastify();
+    const store = {
+      authorize(documentId: string, accessToken: string) {
+        if (documentId !== 'document' || accessToken !== 'access') return null;
+        return { record: { manifest: { pageCount: 2 } }, owner: false };
+      },
+    } as unknown as DocumentStore;
+    attachRelay(app, store);
+    let sender: Messages | undefined;
+    let receiver: Messages | undefined;
+    try {
+      const address = await app.listen({ host: '127.0.0.1', port: 0 });
+      const url = `${address.replace(/^http/, 'ws')}/ws`;
+      sender = new Messages(url);
+      receiver = new Messages(url);
+      await sender.open();
+      sender.send({ type: 'join', documentId: 'document', accessToken: 'access', clientId: 'sender', name: 'Sender' });
+      await sender.next(message => message.type === 'welcome');
+      await receiver.open();
+      receiver.send({ type: 'join', documentId: 'document', accessToken: 'access', clientId: 'receiver', name: 'Receiver' });
+      await receiver.next(message => message.type === 'welcome');
+      receiver.send({ type: 'subscribe', keys: ['drawing:draw1', 'drawing:draw2', 'drawing:draw3'] });
+
+      const index = new Y.Doc();
+      index.on('update', update => sender!.send({ type: 'update', key: 'index', update: Buffer.from(update).toString('base64') }));
+      for (const [number, y] of [700, 790, 830].entries()) {
+        const id = `draw${number + 1}`;
+        index.getMap<DrawingMeta>('drawings').set(id, { ...meta, id, y });
+        const body = new Y.Doc();
+        body.transact(() => {
+          body.getMap('geometry').set('version', 1);
+          body.getMap('geometry').set('curves', encodeCurves(curves));
+        });
+        sender.send({ type: 'update', key: `drawing:${id}`, update: base64(body) });
+      }
+      for (let number = 1; number <= 3; number++) {
+        const received = await receiver.next(message => message.type === 'update' && message.key === `drawing:draw${number}`);
+        if (received.type !== 'update') throw new Error('Expected drawing update');
+        const body = new Y.Doc();
+        Y.applyUpdate(body, Buffer.from(received.update, 'base64'));
+        expect(body.getMap('geometry').get('curves')).toEqual(encodeCurves(curves));
+      }
+    } finally {
+      sender?.close();
+      receiver?.close();
+      await app.close();
+    }
+  });
+
   it('validates drawing index/body and bounds preview deltas while routing geometry to an offscreen owner', async () => {
     const app = Fastify();
     const store = {

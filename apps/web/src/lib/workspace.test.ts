@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import Fastify from 'fastify';
 import * as Y from 'yjs';
+import { WebSocket as RealWebSocket } from 'ws';
 import {
   noteFontSize, type ClientMessage, type CubicBezier, type DocumentManifest, type DrawingMeta, type NoteMeta,
   type ServerMessage, type SessionOptions,
@@ -25,6 +27,8 @@ vi.mock('./storage', () => ({
 
 import { WorkspaceSession } from './workspace';
 import { getYState, saveYUpdates } from './storage';
+import type { DocumentStore } from '../../../server/src/store';
+import { attachRelay } from '../../../server/src/relay';
 
 class Socket {
   static OPEN = 1;
@@ -412,6 +416,92 @@ describe('WorkspaceSession', () => {
     expect((socket.sent[0] as Extract<ClientMessage, { type: 'join' }>).documentId).toBe('uploaded-document');
     expect(socket.sent.some(message => message.type === 'state' && message.key === `drawing:${id}`)).toBe(true);
     await shared.destroy();
+  });
+
+  it('keeps rapid consecutive strokes through save and lazy page-boundary reload', async () => {
+    const localOptions = { ...options(true), localOnly: true };
+    const session = new WorkspaceSession(localOptions);
+    session.connect();
+    await vi.waitFor(() => expect(vi.mocked(getYState)).toHaveBeenCalledWith('document', 'index'));
+    const ids = [780, 830, 860].map((y, index) => session.createDrawing(
+      { ...drawingMeta(y), x: 20 + index * 40 }, drawingCurves,
+    ));
+    expect(session.getSnapshot().drawings.map(drawing => drawing.id)).toEqual(ids);
+    expect(session.getSnapshot().drawings.every(drawing => drawing.curves !== null)).toBe(true);
+    await session.flush();
+    await session.destroy();
+
+    const reopened = new WorkspaceSession(localOptions);
+    reopened.setVisibleRange(855, 900);
+    reopened.connect();
+    await vi.waitFor(() => expect(reopened.getSnapshot().drawings).toHaveLength(3));
+    await vi.waitFor(() => expect(reopened.getSnapshot().drawings[1]?.curves).toEqual(drawingCurves));
+    expect(reopened.getSnapshot().drawings[0]?.curves).toBeNull();
+    reopened.setVisibleRange(0, 900);
+    await vi.waitFor(() => expect(reopened.getSnapshot().drawings.every(drawing => drawing.curves !== null)).toBe(true));
+    await reopened.destroy();
+  });
+
+  it('restores a shared guest’s saved strokes after reload and relay restart, then serves them to a fresh guest', async () => {
+    vi.stubGlobal('WebSocket', RealWebSocket);
+    const store = {
+      authorize(documentId: string, accessToken: string, ownerToken?: string) {
+        if (documentId !== 'document' || accessToken !== 'access' || ownerToken) return null;
+        return { record: { manifest }, owner: false };
+      },
+    } as unknown as DocumentStore;
+    const firstRelay = Fastify();
+    attachRelay(firstRelay, store);
+    let secondRelay: ReturnType<typeof Fastify> | undefined;
+    let original: WorkspaceSession | undefined;
+    let sameRelayReload: WorkspaceSession | undefined;
+    let reopened: WorkspaceSession | undefined;
+    let freshGuest: WorkspaceSession | undefined;
+    try {
+      const firstAddress = await firstRelay.listen({ host: '127.0.0.1', port: 0 });
+      vi.stubGlobal('location', { protocol: 'http:', host: new URL(firstAddress).host });
+      original = new WorkspaceSession(options());
+      original.setVisibleRange(0, 900);
+      original.connect();
+      await vi.waitFor(() => expect(original!.getSnapshot().connection).toBe('online'));
+      const ids = [20, 30, 40].map(y => original!.createDrawing(drawingMeta(y), drawingCurves));
+      await original.flush();
+      for (const id of ids) expect(persistence.states.has(`document:drawing:${id}`)).toBe(true);
+      await original.destroy();
+
+      sameRelayReload = new WorkspaceSession(options());
+      sameRelayReload.setVisibleRange(0, 900);
+      sameRelayReload.connect();
+      await vi.waitFor(() => expect(sameRelayReload!.getSnapshot().connection).toBe('online'));
+      await vi.waitFor(() => expect(sameRelayReload!.getSnapshot().drawings.map(drawing => drawing.id)).toEqual(ids));
+      await vi.waitFor(() => expect(sameRelayReload!.getSnapshot().drawings.every(drawing => drawing.curves !== null)).toBe(true));
+      await sameRelayReload.destroy();
+      await firstRelay.close();
+
+      secondRelay = Fastify();
+      attachRelay(secondRelay, store);
+      const secondAddress = await secondRelay.listen({ host: '127.0.0.1', port: 0 });
+      vi.stubGlobal('location', { protocol: 'http:', host: new URL(secondAddress).host });
+      reopened = new WorkspaceSession(options());
+      reopened.setVisibleRange(0, 900);
+      reopened.connect();
+      await vi.waitFor(() => expect(reopened!.getSnapshot().connection).toBe('online'));
+      await vi.waitFor(() => expect(reopened!.getSnapshot().drawings.map(drawing => drawing.id)).toEqual(ids));
+      await vi.waitFor(() => expect(reopened!.getSnapshot().drawings.every(drawing => drawing.curves !== null)).toBe(true));
+
+      freshGuest = new WorkspaceSession({ ...options(), storageId: 'fresh-guest' });
+      freshGuest.setVisibleRange(0, 900);
+      freshGuest.connect();
+      await vi.waitFor(() => expect(freshGuest!.getSnapshot().drawings.map(drawing => drawing.id)).toEqual(ids));
+      await vi.waitFor(() => expect(freshGuest!.getSnapshot().drawings.every(drawing => drawing.curves !== null)).toBe(true));
+    } finally {
+      await freshGuest?.destroy();
+      await reopened?.destroy();
+      await sameRelayReload?.destroy();
+      await original?.destroy();
+      if (secondRelay) await secondRelay.close();
+      else await firstRelay.close();
+    }
   });
 
   it('queues offscreen owner geometry, loads a crossing-page stroke lazily, and ignores a late body after deletion', async () => {

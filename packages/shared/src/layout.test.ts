@@ -17,7 +17,7 @@ describe('cross-page note geometry', () => {
     const old: NoteMeta = {id:'old',anchorPage:1,x:-100,y:780,lineCount:3};
     expect(noteFontSize(old)).toBe(18);
     expect(noteLineHeight(old)).toBe(26);
-    expect(noteHeight(old)).toBe(92);
+    expect(noteHeight(old)).toBe(84);
     expect(noteIntersects(old,pages,950,1000)).toBe(false);
     expect(noteIntersects({...old,fontSize:36},pages,950,1000)).toBe(true);
     expect(noteFontSize({fontSize:0})).toBe(1);

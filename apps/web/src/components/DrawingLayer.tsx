@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef } from 'react';
 import type { Camera, CubicBezier, CursorPosition, DrawingShape, PageLayout, RemoteDrawingPreview } from '../../../../packages/shared/src/index';
 import { drawArrowHead, traceCurves } from '../lib/drawingGeometry';
 
@@ -121,37 +121,35 @@ export const DrawingLayer = forwardRef<DrawingLayerHandle, DrawingLayerProps>(fu
     },
   }), []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const canvas = staticCanvas.current;
     if (!canvas) return;
-    const frame = requestAnimationFrame(() => {
-      const setup = prepare(canvas, width, height);
-      if (!setup) return;
-      const { context, ratio } = setup;
-      setWorldTransform(context, ratio, camera);
-      const visibleLeft = camera.scrollLeft / camera.zoom;
-      const visibleTop = camera.scrollTop / camera.zoom;
-      const visibleRight = visibleLeft + width / camera.zoom;
-      const visibleBottom = visibleTop + height / camera.zoom;
-      for (const drawing of drawings) {
-        if (!drawing.curves?.length) continue;
-        const page = pages[drawing.anchorPage - 1];
-        if (!page) continue;
-        const x = page.x + drawing.x, y = page.y + drawing.y;
-        const bounds = drawing.bounds;
-        if (x + bounds.maxX < visibleLeft || x + bounds.minX > visibleRight ||
-            y + bounds.maxY < visibleTop || y + bounds.minY > visibleBottom) continue;
-        context.save();
-        context.translate(x, y);
-        context.lineWidth = drawing.width;
-        context.beginPath();
-        traceCurves(context, drawing.curves);
-        if (drawing.kind === 'arrow') drawArrowHead(context, drawing.curves, drawing.width);
-        context.stroke();
-        context.restore();
-      }
-    });
-    return () => cancelAnimationFrame(frame);
+    // Paint committed geometry before the active preview can clear on the next frame.
+    const setup = prepare(canvas, width, height);
+    if (!setup) return;
+    const { context, ratio } = setup;
+    setWorldTransform(context, ratio, camera);
+    const visibleLeft = camera.scrollLeft / camera.zoom;
+    const visibleTop = camera.scrollTop / camera.zoom;
+    const visibleRight = visibleLeft + width / camera.zoom;
+    const visibleBottom = visibleTop + height / camera.zoom;
+    for (const drawing of drawings) {
+      if (!drawing.curves?.length) continue;
+      const page = pages[drawing.anchorPage - 1];
+      if (!page) continue;
+      const x = page.x + drawing.x, y = page.y + drawing.y;
+      const bounds = drawing.bounds;
+      if (x + bounds.maxX < visibleLeft || x + bounds.minX > visibleRight ||
+          y + bounds.maxY < visibleTop || y + bounds.minY > visibleBottom) continue;
+      context.save();
+      context.translate(x, y);
+      context.lineWidth = drawing.width;
+      context.beginPath();
+      traceCurves(context, drawing.curves);
+      if (drawing.kind === 'arrow') drawArrowHead(context, drawing.curves, drawing.width);
+      context.stroke();
+      context.restore();
+    }
   }, [drawings, pages, camera, width, height]);
 
   useEffect(() => { scheduleActive(); }, [previews, camera, width, height]);

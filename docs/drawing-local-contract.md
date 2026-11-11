@@ -40,3 +40,7 @@ Meaningful tests for geometric approximation/corners/duplicates/encoding, drawin
 - createDrawing(meta, curves, id?) accepts the preview ID so final geometry replaces the matching provisional stroke. seq0 can reset an ongoing preview after bounded resampling or an idle pause.
 - onUpload accepts an optional beforeTransition callback. Workspace flushes before starting and supplies another flush to run after upload completes, before switching sessions; edits made during a long upload are included.
 - Local SPA route is /local/:documentId. Fingerprint endpoint also requires x-owner-token; it is an owner-only migration aid.
+
+## Ink completion and compact notes
+Completed geometry paints in a layout effect before the active-preview canvas clears, so pen-up and lazy restoration never depend on a later passive paint. A browser pointercancel or unexpected lostpointercapture commits the samples already collected without adding synthetic endpoint coordinates. A no-motion double-press only creates text on a real pointerup; intentional two-finger pinch still discards the provisional stroke. Ignore wheel momentum while inking.
+Note padding is 2 canonical units; width follows measured literal lines with 2 units of caret slack and no 32-unit minimum. Drag handles extend outward and stop before the textarea, including at font size 1. Shared noteHeight and selection bounds use the same padding.

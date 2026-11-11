@@ -20,10 +20,10 @@ let measureContext: CanvasRenderingContext2D | null = null;
 
 function noteWidth(text: string, fontSize: number): number {
   if (!measureContext) measureContext = document.createElement('canvas').getContext('2d');
-  if (!measureContext) return 60;
+  if (!measureContext) return text.split('\n').reduce((width, line) => Math.max(width, line.length * fontSize + 2), 2);
   measureContext.font = `${fontSize}px Arial, Helvetica, sans-serif`;
-  let width = 32;
-  for (const line of text.split('\n')) width = Math.max(width, Math.ceil(measureContext.measureText(line || ' ').width + 5));
+  let width = 2;
+  for (const line of text.split('\n')) width = Math.max(width, Math.ceil(measureContext.measureText(line || ' ').width + 2));
   return width;
 }
 
@@ -335,11 +335,8 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
       event.preventDefault();
       session.activity();
       pressCandidate.current = null;
-      if (activeDrawing.current) {
-        activeDrawing.current = null;
-        drawingLayerRef.current?.clearActive();
-        session.sendDrawingPreview(null);
-      }
+      // Trackpad momentum must not cancel ink while a pointer is still down.
+      if (activeDrawing.current) return;
       eraserPointer.current = null;
       lastClientPointer.current = { x: event.clientX, y: event.clientY };
       const current = cameraRef.current;
@@ -511,10 +508,13 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
     if (!drawing || drawing.pointerId !== event.pointerId) return;
     if (event.type === 'pointerup') sampleDrawing(event);
     try {
-      if (event.type !== 'pointerup') return;
+      // Keep the samples already drawn if the browser interrupts capture.
+      // Cancellation coordinates are synthetic, so only pointerup is sampled.
       if (drawing.gesture && !drawing.moved) {
-        suppressDoubleClickUntil.current = performance.now() + 700;
-        createNoteAt(event.clientX, event.clientY);
+        if (event.type === 'pointerup') {
+          suppressDoubleClickUntil.current = performance.now() + 700;
+          createNoteAt(event.clientX, event.clientY);
+        }
         return;
       }
       if (drawing.kind === 'arrow' && !drawing.moved) return;
