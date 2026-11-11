@@ -26,7 +26,9 @@ function onePagePdf(): string {
 
 describe('local PDF byte source', () => {
   it('reads page metadata and an absent outline without rendering a page or fetching the network', async () => {
-    GlobalWorkerOptions.workerSrc = pathToFileURL(resolve('node_modules/pdfjs-dist/build/pdf.worker.min.mjs')).toString();
+    // This integration test executes the worker in Node 24, which needs PDF.js's
+    // compatibility build for browser-only APIs such as Uint8Array.toHex.
+    GlobalWorkerOptions.workerSrc = pathToFileURL(resolve('node_modules/pdfjs-dist/legacy/build/pdf.worker.min.mjs')).toString();
     const reads: number[] = [];
     class TrackedBlob extends Blob {
       override slice(start?: number, end?: number, contentType?: string): Blob {
