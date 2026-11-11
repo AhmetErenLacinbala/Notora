@@ -1,11 +1,8 @@
 name: notora
 services:
   app:
-    image: notora:${NOTORA_VERSION:-local}
-    build:
-      context: .
-      args:
-        REVISION: ${NOTORA_REVISION:-development}
+    image: ghcr.io/ahmeterenlacinbala/notora:${NOTORA_VERSION:-latest}
+    pull_policy: always
     restart: unless-stopped
     init: true
     environment:
@@ -40,7 +37,7 @@ services:
       traefik.http.routers.notora.tls: 'true'
       traefik.http.routers.notora.tls.certresolver: le
       traefik.http.services.notora.loadbalancer.server.port: '3000'
-      com.centurylinklabs.watchtower.enable: 'false'
+      com.centurylinklabs.watchtower.enable: '${NOTORA_AUTO_UPDATE:-true}'
 volumes:
   notora-data:
 networks:
