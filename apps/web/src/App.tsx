@@ -31,6 +31,8 @@ function errorText(error: unknown): string {
 
 export default function App() {
   const [profile, setProfile] = useState<Profile | null | undefined>(undefined);
+  const [startupError, setStartupError] = useState('');
+  const [startupAttempt, setStartupAttempt] = useState(0);
   const [route, setRoute] = useState<Route>(currentRoute);
   const [recent, setRecent] = useState<Recent[]>([]);
   const [homeError, setHomeError] = useState('');
@@ -40,13 +42,16 @@ export default function App() {
   useEffect(() => {
     let live = true;
     getProfile().then(value => { if (live) setProfile(value); }).catch(error => {
-      if (live) { setProfile(null); setHomeError(errorText(error)); }
+      if (live) setStartupError(errorText(error));
     });
+    return () => { live = false; };
+  }, [startupAttempt]);
+
+  useEffect(() => {
     const updateRoute = () => setRoute(currentRoute());
     window.addEventListener('popstate', updateRoute);
     window.addEventListener('hashchange', updateRoute);
     return () => {
-      live = false;
       window.removeEventListener('popstate', updateRoute);
       window.removeEventListener('hashchange', updateRoute);
     };
@@ -95,6 +100,7 @@ export default function App() {
     }
   };
 
+  if (profile === undefined && startupError) return <div className="name-shell"><main className="name-panel"><span className="brand">notora<span>.</span></span><h1>Couldn’t open local storage</h1><p role="alert">{startupError}</p><button type="button" className="primary-button" onClick={() => { setStartupError(''); setStartupAttempt(attempt => attempt + 1); }}>Try again</button></main></div>;
   if (profile === undefined) return <div className="app-loading" aria-label="Loading Notora">notora<span>.</span></div>;
   if (profile === null) return <NameGate onSubmit={submitName} initialError={homeError} />;
   if (route?.kind === 'remote') return <DocumentRoute key={`remote:${route.documentId}`} route={route} profile={profile} onHome={() => navigate(null)} />;

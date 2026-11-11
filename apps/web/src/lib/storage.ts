@@ -24,29 +24,103 @@ interface NotoraDatabase extends DBSchema {
   localBlobs: { key: string; value: Blob };
 }
 
+const STORAGE_WAIT_MS = 10_000;
+
+export class StorageConnectionError extends Error {
+  constructor(readonly reason: 'blocked' | 'timeout') {
+    super(reason === 'blocked'
+      ? 'Close other Notora tabs, then try again. Your saved PDFs and notes are still in this browser.'
+      : 'Browser storage is not responding. Close other Notora tabs, then try again. Your saved PDFs and notes are still in this browser.');
+    this.name = 'StorageConnectionError';
+  }
+}
+
 let databasePromise: Promise<IDBPDatabase<NotoraDatabase>> | undefined;
+let upgradeBlocked = false;
+const blockedListeners = new Set<() => void>();
+
+function resetDatabaseConnection(request: Promise<IDBPDatabase<NotoraDatabase>>): void {
+  if (databasePromise !== request) return;
+  databasePromise = undefined;
+  upgradeBlocked = false;
+}
+
+function waitForStorage<T>(operation: Promise<T>, watchBlocked = false): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const finish = (settle: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (timeout !== undefined) clearTimeout(timeout);
+      blockedListeners.delete(onBlocked);
+      settle();
+    };
+    const onBlocked = () => finish(() => reject(new StorageConnectionError('blocked')));
+    timeout = setTimeout(
+      () => finish(() => reject(new StorageConnectionError(watchBlocked && upgradeBlocked ? 'blocked' : 'timeout'))),
+      STORAGE_WAIT_MS,
+    );
+    if (watchBlocked) blockedListeners.add(onBlocked);
+    operation.then(
+      value => finish(() => resolve(value)),
+      error => finish(() => reject(error)),
+    );
+  });
+}
 
 function database(): Promise<IDBPDatabase<NotoraDatabase>> {
-  databasePromise ??= openDB<NotoraDatabase>('notora', 2, {
-    upgrade(db, oldVersion) {
-      if (oldVersion < 1) {
-        db.createObjectStore('profile');
-        db.createObjectStore('ownedProjects');
-        db.createObjectStore('cameras');
-        db.createObjectStore('pages');
-        db.createObjectStore('yUpdates');
-      }
-      if (oldVersion < 2) {
-        db.createObjectStore('localDocuments');
-        db.createObjectStore('localBlobs');
-      }
-    },
-  });
-  return databasePromise;
+  if (!databasePromise) {
+    let request!: Promise<IDBPDatabase<NotoraDatabase>>;
+    let connection: IDBPDatabase<NotoraDatabase> | undefined;
+    request = openDB<NotoraDatabase>('notora', 2, {
+      upgrade(db, oldVersion) {
+        if (oldVersion < 1) {
+          db.createObjectStore('profile');
+          db.createObjectStore('ownedProjects');
+          db.createObjectStore('cameras');
+          db.createObjectStore('pages');
+          db.createObjectStore('yUpdates');
+        }
+        if (oldVersion < 2) {
+          db.createObjectStore('localDocuments');
+          db.createObjectStore('localBlobs');
+        }
+      },
+      blocked() {
+        upgradeBlocked = true;
+        for (const listener of [...blockedListeners]) listener();
+      },
+      blocking() {
+        // Release this tab's connection when a later app version needs an upgrade.
+        connection?.close();
+        void request.then(db => db.close());
+        resetDatabaseConnection(request);
+      },
+      terminated() {
+        resetDatabaseConnection(request);
+      },
+    });
+    databasePromise = request;
+    // A timed-out or blocked caller must not start a second open request.
+    // Keep this request so a later successful upgrade is adopted on retry.
+    void request.then(
+      db => {
+        if (databasePromise === request) {
+          connection = db;
+          upgradeBlocked = false;
+        } else {
+          db.close();
+        }
+      },
+      () => resetDatabaseConnection(request),
+    );
+  }
+  return waitForStorage(databasePromise, true);
 }
 
 export async function getProfile(): Promise<Profile | null> {
-  return (await (await database()).get('profile', 'current')) ?? null;
+  return (await waitForStorage(database().then(db => db.get('profile', 'current')))) ?? null;
 }
 
 export async function saveProfile(profile: Profile): Promise<void> {
