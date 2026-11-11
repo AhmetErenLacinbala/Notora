@@ -9,13 +9,17 @@
     "build": "vite build --config apps/web/vite.config.ts && node scripts/copy-pdf-assets.mjs",
     "start": "node --import tsx apps/server/src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "r2:check": "wrangler deploy --dry-run --config cloudflare/wrangler.jsonc",
+    "r2:deploy": "wrangler deploy --config cloudflare/wrangler.jsonc",
+    "r2:migrate": "node --import tsx apps/server/src/migrate-r2.ts"
   },
   "dependencies": {
     "@fastify/multipart": "10.1.8",
     "@fastify/static": "10.1.10",
     "@noble/hashes": "2.4.0",
     "fastify": "5.12.8",
+    "geoip-country": "5.0.202611110258",
     "idb": "8.0.4",
     "pdfjs-dist": "6.5.438",
     "react": "19.3.1",
@@ -32,6 +36,12 @@
     "fake-indexeddb": "6.2.8",
     "typescript": "7.0.2",
     "vite": "8.3.7",
-    "vitest": "5.1.0"
+    "vitest": "5.1.0",
+    "wrangler": "4.160.1"
+  },
+  "overrides": {
+    "geoip-country": {
+      "ip-address": "10.7.6"
+    }
   }
 }

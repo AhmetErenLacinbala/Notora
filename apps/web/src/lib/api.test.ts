@@ -123,6 +123,14 @@ describe('document API', () => {
     expect(fetchMock.mock.calls.every(call => new Headers(call[1]?.headers).get('Authorization') === 'Bearer secret')).toBe(true);
   });
 
+  it('surfaces page storage errors without writing a failed response to owner cache', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ error: 'Storage temporarily unavailable.' }, { status: 503 })));
+    await expect(getPageBytes('doc', 'v1', 1, 'secret', undefined, 'owner')).rejects.toMatchObject({
+      name: 'ApiError', status: 503, message: 'Storage temporarily unavailable.',
+    });
+    expect(saveCachedPage).not.toHaveBeenCalled();
+  });
+
   it('uploads sequential bounded slices with bearer headers and completes before reporting 100', async () => {
     const progress: number[] = [];
     const file = new File([new Uint8Array(3 * MAX_UPLOAD_CHUNK_BYTES + 100)], 'notes.pdf', { type: 'application/pdf' });
@@ -148,14 +156,14 @@ describe('document API', () => {
       xhr.respond(200, { offset: state.offset });
     };
 
-    await expect(uploadPdf(file, percent => progress.push(percent), 'Test Host')).resolves.toEqual(uploadResult);
+    await expect(uploadPdf(file, percent => progress.push(percent), 'Test Host', 'profile-123')).resolves.toEqual(uploadResult);
     expect(UploadXHR.instances.map(xhr => (xhr.body as Blob).size).slice(0, 3))
       .toEqual([64 * 1024, 256 * 1024, MAX_UPLOAD_CHUNK_BYTES]);
     expect(progress.at(-1)).toBe(100);
     expect(progress.every((value, index) => index === 0 || value >= progress[index - 1])).toBe(true);
     expect(fetchMock.mock.calls[0][1]).toMatchObject({
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename: file.name, size: file.size, hostName: 'Test Host' }),
+      body: JSON.stringify({ filename: file.name, size: file.size, hostName: 'Test Host', hostId: 'profile-123' }),
     });
     expect(fetchMock.mock.calls.at(-1)?.[1]).toMatchObject({
       method: 'POST', headers: { Authorization: 'Bearer upload-secret' },

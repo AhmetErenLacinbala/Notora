@@ -620,6 +620,10 @@ describe('WorkspaceSession', () => {
         if (documentId !== 'document' || accessToken !== 'access' || ownerToken && ownerToken !== 'owner') return null;
         return { record: { manifest }, owner: ownerToken === 'owner' };
       },
+      beginSession(documentId: string) {
+        if (documentId !== 'document') throw new Error('Document unavailable');
+        return () => {};
+      },
     } as unknown as DocumentStore;
     const firstRelay = Fastify();
     attachRelay(firstRelay, store);

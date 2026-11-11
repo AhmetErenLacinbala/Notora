@@ -1,7 +1,7 @@
 import { memo, useEffect, useRef, useState } from 'react';
 import { getDocument, GlobalWorkerOptions, TextLayer } from 'pdfjs-dist';
 import type { Destination, PageLayout, PageLink } from '../../../../packages/shared/src/index';
-import { getPageBytes, getPageLinks } from '../lib/api';
+import { fetchPageBytes, fetchPageLinks } from '../lib/pageTransfers';
 import type { LocalPdfSource } from '../lib/localPdf';
 
 GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString();
@@ -58,6 +58,8 @@ export interface PdfPageProps {
   localPdf?: LocalPdfSource;
 }
 
+type PageBytesRequest = { controller: AbortController; promise: Promise<Uint8Array>; failed: boolean };
+
 export const PdfPage = memo(function PdfPage({ page, documentId, version, accessToken, ownerToken, zoom, active, retain, onReady, onDestination, localPdf }: PdfPageProps) {
   const canvasSlotRef = useRef<HTMLDivElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
@@ -65,6 +67,7 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
   const readyNotified = useRef(false);
   const linksLoaded = useRef(false);
   const linksController = useRef<AbortController | null>(null);
+  const pageRequest = useRef<PageBytesRequest | null>(null);
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;
   const [links, setLinks] = useState<PageLink[]>([]);
@@ -102,6 +105,29 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
     textRef.current?.replaceChildren();
   }, [active, retain]);
 
+  // Keep a nearby page's file request across zoom changes. PDF.js receives a
+  // copy below because it may transfer its input buffer to a worker.
+  useEffect(() => () => {
+    pageRequest.current?.controller.abort();
+    pageRequest.current = null;
+  }, [active, documentId, version, page.number, accessToken, ownerToken, localPdf]);
+
+  const pixelLimit = Math.sqrt(10_000_000 / Math.max(1, page.width * page.height));
+  const pixelRatio = Math.max(0.1, Math.min((window.devicePixelRatio || 1) * settledZoom, 2.5, pixelLimit));
+
+  useEffect(() => {
+    if (!active || localPdf || renderedRatio.current >= pixelRatio - 0.001) return;
+    if (pageRequest.current && !pageRequest.current.failed) return;
+    pageRequest.current?.controller.abort();
+    const controller = new AbortController();
+    const request: PageBytesRequest = { controller, promise: Promise.resolve(new Uint8Array()), failed: false };
+    request.promise = fetchPageBytes(documentId, version, page.number, accessToken, controller.signal, ownerToken)
+      .catch(error => { request.failed = true; throw error; });
+    // The render effect may still be waiting for a render slot when this fails.
+    void request.promise.catch(() => undefined);
+    pageRequest.current = request;
+  }, [active, documentId, version, page.number, accessToken, ownerToken, localPdf, pixelRatio, retry]);
+
   useEffect(() => {
     // A completed desktop page can finish an already-started link request
     // offscreen; it then needs no new request when the user returns.
@@ -115,7 +141,7 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
     if (!active || linksLoaded.current || linksController.current) return;
     const controller = new AbortController();
     linksController.current = controller;
-    (localPdf ? localPdf.getPageLinks(page.number) : getPageLinks(documentId, page.number, accessToken, controller.signal))
+    (localPdf ? localPdf.getPageLinks(page.number) : fetchPageLinks(documentId, page.number, accessToken, controller.signal))
       .then(value => {
         if (controller.signal.aborted) return;
         linksLoaded.current = true;
@@ -137,8 +163,6 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
 
   useEffect(() => {
     if (!active || settledZoom !== zoom) return;
-    const pixelLimit = Math.sqrt(10_000_000 / Math.max(1, page.width * page.height));
-    const pixelRatio = Math.max(0.1, Math.min((window.devicePixelRatio || 1) * settledZoom, 2.5, pixelLimit));
     // A higher-resolution canvas continues to satisfy lower zoom levels.
     if (renderedRatio.current >= pixelRatio - 0.001) return;
 
@@ -162,16 +186,17 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
 
     const render = async () => {
       try {
+        const cachedBytes = localPdf ? undefined : await pageRequest.current?.promise;
+        if (controller.signal.aborted) return;
+        if (!localPdf && !cachedBytes) throw new Error('Page request was unavailable.');
         release = await acquirePage(controller.signal);
         let pdfPage;
         if (localPdf) {
           pdfPage = await localPdf.getPage(page.number);
         } else {
-          const cachedBytes = await getPageBytes(documentId, version, page.number, accessToken, controller.signal, ownerToken);
-          if (controller.signal.aborted) return;
           // PDF.js transfers the input buffer to its worker; keep the cache copy intact.
           loadingTask = getDocument({
-            data: new Uint8Array(cachedBytes),
+            data: new Uint8Array(cachedBytes!),
             disableAutoFetch: true,
             disableStream: true,
             cMapUrl: '/pdf-assets/cmaps/',
@@ -259,7 +284,7 @@ export const PdfPage = memo(function PdfPage({ page, documentId, version, access
       textLayer?.cancel();
       void destroyDocument();
     };
-  }, [active, documentId, version, page.number, page.width, page.height, accessToken, ownerToken, zoom, settledZoom, retry, localPdf]);
+  }, [active, documentId, version, page.number, page.width, page.height, accessToken, ownerToken, zoom, settledZoom, pixelRatio, retry, localPdf]);
 
   return <div className="pdf-page" data-page={page.number} style={{ left: page.x, top: page.y, width: page.width, height: page.height }}>
     <div ref={canvasSlotRef} style={{ width: '100%', height: '100%' }} aria-hidden="true" />

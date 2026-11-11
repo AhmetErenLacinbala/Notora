@@ -37,6 +37,7 @@ interface Peer {
   preview: { packet: DrawingPreviewPacket; pointCount: number; lastAt: number } | null;
   previewTokens: number;
   previewBudgetAt: number;
+  releaseSession: () => void;
 }
 
 interface Room {
@@ -186,6 +187,7 @@ export function attachRelay(server: FastifyInstance, store: DocumentStore): void
   const removePeer = (peer: Peer) => {
     const room = peer.room;
     if (!room.peers.delete(peer)) return;
+    peer.releaseSession();
     clearPreview(peer);
     if (room.peers.size === 0) {
       for (const doc of room.docs.values()) doc.destroy();
@@ -379,10 +381,14 @@ export function attachRelay(server: FastifyInstance, store: DocumentStore): void
       socket.close(1008, 'Client ID already in use');
       return null;
     }
+    let releaseSession: () => void;
+    try { releaseSession = store.beginSession(message.documentId); }
+    catch { socket.close(1008, 'Document unavailable'); return null; }
     const peer: Peer = {
       socket, id: message.clientId, name: message.name.trim(), color: colorFor(message.clientId),
       owner: auth.owner, cursor: null, subscriptions: new Set(), room, lastCursorAt: 0,
       preview: null, previewTokens: PREVIEW_BURST, previewBudgetAt: Date.now(),
+      releaseSession,
     };
     room.peers.add(peer);
     store.recordDashboardAccess?.(message.documentId, peer.owner ? peer.name : undefined);

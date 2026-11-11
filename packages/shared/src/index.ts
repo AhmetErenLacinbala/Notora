@@ -23,13 +23,24 @@ export interface DocumentManifest {
   pageCount: number; pages: PageInfo[]; outline: OutlineItem[]; error?: string;
   contentHash?: string;
 }
+export interface UploadProvenance {
+  hostId: string | null; ipAddress: string | null; countryCode: string | null;
+  userAgent: string | null;
+}
+export interface StorageBudget {
+  provider: 'local' | 'r2'; usedBytes: number; reservedBytes: number; limitBytes: number;
+  classAUsed: number; classALimit: number; classBUsed: number; classBLimit: number;
+  month: string; available: boolean;
+  classADailyUsed?: number; classADailyLimit?: number; classBDailyUsed?: number; classBDailyLimit?: number;
+}
 export interface DashboardDocument {
   id: string; title: string; hostName: string | null;
   uploadedAt: number | null; lastAccessedAt: number | null;
   sizeBytes: number; pageCount: number; status: DocumentManifest['status'];
+  provenance?: UploadProvenance; storageBytes?: number; storagePrefix?: string; storageProvider?: 'local' | 'r2';
 }
 export interface DashboardDocumentsResponse {
-  documents: DashboardDocument[]; total: number; offset: number; limit: number;
+  documents: DashboardDocument[]; total: number; offset: number; limit: number; storage?: StorageBudget;
 }
 export interface DashboardSession { username: string }
 export interface UploadResult { documentId: string; accessToken: string; ownerToken: string }

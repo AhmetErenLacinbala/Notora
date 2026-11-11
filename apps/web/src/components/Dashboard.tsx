@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import type { DashboardDocument, DashboardDocumentsResponse, DashboardSession } from '../../../../packages/shared/src/index';
+import type { DashboardDocument, DashboardDocumentsResponse, DashboardSession, StorageBudget } from '../../../../packages/shared/src/index';
+import { DashboardRequestError, deleteDashboardDocument, documentsFrom } from '../lib/dashboardData';
 
 const PAGE_SIZE = 50;
 const dateFormatter = new Intl.DateTimeFormat(undefined, {
@@ -16,26 +17,6 @@ function sessionFrom(value: unknown): DashboardSession {
   return { username: value.username };
 }
 
-function documentsFrom(value: unknown): DashboardDocumentsResponse {
-  if (!value || typeof value !== 'object' || !('documents' in value) || !Array.isArray(value.documents) ||
-      !('total' in value) || !Number.isSafeInteger(value.total) || (value.total as number) < 0 ||
-      !('offset' in value) || !Number.isSafeInteger(value.offset) || (value.offset as number) < 0 ||
-      !('limit' in value) || !Number.isSafeInteger(value.limit) || (value.limit as number) <= 0) {
-    throw new Error('The dashboard returned an invalid file list. Please try again.');
-  }
-  if (value.documents.length > (value.limit as number) || value.documents.some((document: unknown) =>
-    !document || typeof document !== 'object' ||
-    !('id' in document) || typeof document.id !== 'string' ||
-    !('title' in document) || typeof document.title !== 'string' ||
-    !('hostName' in document) || (document.hostName !== null && typeof document.hostName !== 'string') ||
-    !('uploadedAt' in document) || (document.uploadedAt !== null && !Number.isFinite(document.uploadedAt)) ||
-    !('lastAccessedAt' in document) || (document.lastAccessedAt !== null && !Number.isFinite(document.lastAccessedAt)) ||
-    !('status' in document) || !['processing', 'ready', 'error'].includes(String(document.status)))) {
-    throw new Error('The dashboard returned an invalid file list. Please try again.');
-  }
-  return value as DashboardDocumentsResponse;
-}
-
 function timestamp(value: number | null): { label: string; iso: string } | null {
   if (value === null || !Number.isFinite(value)) return null;
   const date = new Date(value);
@@ -48,10 +29,34 @@ function Timestamp({ value }: { value: number | null }) {
   return formatted ? <time dateTime={formatted.iso}>{formatted.label}</time> : <span className="dashboard-unknown">Not recorded</span>;
 }
 
-function statusLabel(status: DashboardDocument['status']): string | null {
+function statusLabel(status: DashboardDocument['status']): string {
   if (status === 'processing') return 'Processing';
   if (status === 'error') return 'Preparation failed';
-  return null;
+  return 'Ready';
+}
+
+function bytes(value: number): string {
+  if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(2)} GB`;
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)} MB`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)} kB`;
+  return `${value} B`;
+}
+
+function Recorded({ value }: { value: string | null | undefined }) {
+  return value ? <span>{value}</span> : <span className="dashboard-unknown">Not recorded</span>;
+}
+
+function StorageSummary({ storage }: { storage: StorageBudget }) {
+  const remaining = Math.max(0, storage.limitBytes - storage.usedBytes - storage.reservedBytes);
+  return <section className="dashboard-storage" aria-label="Storage budget">
+    <div className="dashboard-storage-main"><div><span className="dashboard-eyebrow">Storage budget</span><strong>{storage.available ? `${bytes(storage.usedBytes)} used` : 'Usage unavailable'} <span>/ {bytes(storage.limitBytes)} limit</span></strong></div><span className={`dashboard-availability${storage.available ? '' : ' is-unavailable'}`}>{storage.available ? 'Available' : 'Unavailable'}</span></div>
+    <div className="dashboard-storage-detail"><span>Provider: <strong>{storage.provider === 'r2' ? 'Cloudflare R2' : 'Local'}</strong></span>{storage.available && <><span>Reserved: <strong>{bytes(storage.reservedBytes)}</strong></span><span>Remaining: <strong>{bytes(remaining)}</strong></span></>}
+      {storage.classADailyLimit !== undefined && storage.classADailyLimit > 0 && <span>Class A today (UTC): <strong>{storage.available && storage.classADailyUsed !== undefined ? `${storage.classADailyUsed.toLocaleString()} / ` : 'Cap '}{storage.classADailyLimit.toLocaleString()}</strong></span>}
+      {storage.classBDailyLimit !== undefined && storage.classBDailyLimit > 0 && <span>Class B today (UTC): <strong>{storage.available && storage.classBDailyUsed !== undefined ? `${storage.classBDailyUsed.toLocaleString()} / ` : 'Cap '}{storage.classBDailyLimit.toLocaleString()}</strong></span>}
+      {storage.classALimit > 0 && <span>Class A {storage.month}: <strong>{storage.available ? `${storage.classAUsed.toLocaleString()} / ` : 'Cap '}{storage.classALimit.toLocaleString()}</strong></span>}
+      {storage.classBLimit > 0 && <span>Class B {storage.month}: <strong>{storage.available ? `${storage.classBUsed.toLocaleString()} / ` : 'Cap '}{storage.classBLimit.toLocaleString()}</strong></span>}
+    </div>
+  </section>;
 }
 
 export function Dashboard() {
@@ -66,6 +71,8 @@ export function Dashboard() {
   const [offset, setOffset] = useState(0);
   const [refreshKey, setRefreshKey] = useState(0);
   const [documents, setDocuments] = useState<Documents>({ kind: 'loading' });
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState('');
 
   useEffect(() => {
     const controller = new AbortController();
@@ -136,6 +143,7 @@ export function Dashboard() {
       if (!response.ok) throw new Error('Couldn’t sign in. Please try again.');
       const session = sessionFrom(await response.json() as unknown);
       setOffset(0);
+      setDeleteError('');
       setAuth({ kind: 'signedIn', username: session.username });
     } catch (error) {
       setLoginError(error instanceof Error ? error.message : 'Couldn’t sign in. Please try again.');
@@ -157,11 +165,34 @@ export function Dashboard() {
       if (response.status !== 204 && response.status !== 401) throw new Error('Couldn’t sign out. Please try again.');
       setDocuments({ kind: 'loading' });
       setOffset(0);
+      setDeleteError('');
       setAuth({ kind: 'signedOut' });
     } catch (error) {
       setLogoutError(error instanceof Error ? error.message : 'Couldn’t sign out. Please try again.');
     } finally {
       setLogoutBusy(false);
+    }
+  };
+
+  const remove = async (document: DashboardDocument) => {
+    if (deletingId) return;
+    const confirmed = window.confirm(`Permanently delete “${document.title}” (ID ${document.id}) from hosted storage? Its shared PDF and prepared pages will be removed, and its share links will stop working. This cannot be undone.`);
+    if (!confirmed) return;
+    setDeletingId(document.id);
+    setDeleteError('');
+    try {
+      await deleteDashboardDocument(document.id);
+      setRefreshKey(value => value + 1);
+    } catch (error) {
+      if (error instanceof DashboardRequestError && error.status === 401) {
+        setDocuments({ kind: 'loading' });
+        setOffset(0);
+        setAuth({ kind: 'signedOut' });
+      } else {
+        setDeleteError(error instanceof Error ? error.message : 'Couldn’t delete this file. Please try again.');
+      }
+    } finally {
+      setDeletingId(null);
     }
   };
 
@@ -178,18 +209,22 @@ export function Dashboard() {
       <button type="submit" className="primary-button" disabled={loginBusy || !username.trim() || !password}>{loginBusy ? 'Signing in…' : 'Sign in'}</button>
     </form>{loginError && <p className="form-error" role="alert">{loginError}</p>}</main>}
     {auth.kind === 'signedIn' && <main className="dashboard-main">
-      <div className="dashboard-heading"><div><h1>Uploaded files</h1><p>Times are shown in your local time zone.</p></div><button type="button" className="secondary-button" disabled={documents.kind === 'loading'} onClick={() => setRefreshKey(value => value + 1)}>Refresh</button></div>
+      <div className="dashboard-heading"><div><h1>Uploaded files</h1><p>Times are shown in your local time zone.</p></div><button type="button" className="secondary-button" disabled={documents.kind === 'loading' || !!deletingId} onClick={() => { setDeleteError(''); setRefreshKey(value => value + 1); }}>Refresh</button></div>
       {logoutError && <p className="form-error" role="alert">{logoutError}</p>}
+      {deleteError && <p className="form-error dashboard-delete-error" role="alert">{deleteError}</p>}
       {documents.kind === 'loading' && <p className="dashboard-message" role="status">Loading files…</p>}
       {documents.kind === 'error' && <div className="dashboard-message"><p role="alert">{documents.message}</p><button type="button" className="secondary-button" onClick={() => setRefreshKey(value => value + 1)}>Try again</button></div>}
-      {documents.kind === 'ready' && (documents.value.total === 0 ? <p className="dashboard-message">No files uploaded yet.</p> : <>
-        <div className="dashboard-table-wrap"><table className="dashboard-table"><caption className="visually-hidden">Uploaded PDFs</caption><thead><tr><th scope="col">File</th><th scope="col">Host</th><th scope="col">Uploaded</th><th scope="col">Last accessed</th></tr></thead><tbody>{documents.value.documents.map(document => <tr key={document.id}>
-          <td><span className="dashboard-file-title">{document.title}</span>{statusLabel(document.status) && <span className="dashboard-file-status">{statusLabel(document.status)}</span>}</td>
-          <td>{document.hostName || <span className="dashboard-unknown">Not recorded</span>}</td>
-          <td><Timestamp value={document.uploadedAt} /></td><td><Timestamp value={document.lastAccessedAt} /></td>
+      {documents.kind === 'ready' && <>{documents.value.storage && <StorageSummary storage={documents.value.storage} />}{documents.value.total === 0 ? <p className="dashboard-message">No files uploaded yet.</p> : <>
+        <div className="dashboard-table-wrap"><table className="dashboard-table"><caption className="visually-hidden">Uploaded PDFs and storage details</caption><thead><tr><th scope="col">File</th><th scope="col">Size and storage</th><th scope="col">Host</th><th scope="col">Request source</th><th scope="col">Activity</th><th scope="col">Action</th></tr></thead><tbody>{documents.value.documents.map(document => <tr key={document.id}>
+          <td><span className="dashboard-file-title">{document.title}</span><span className={`dashboard-file-status status-${document.status}`}>{statusLabel(document.status)}</span><span className="dashboard-field"><span>ID</span><code>{document.id}</code></span><span className="dashboard-field"><span>Prefix</span>{document.storagePrefix ? <code>{document.storagePrefix}</code> : <Recorded value={null} />}</span></td>
+          <td><span className="dashboard-field"><span>Original</span>{bytes(document.sizeBytes)}</span><span className="dashboard-field"><span>Stored</span>{document.storageBytes === undefined ? <Recorded value={null} /> : bytes(document.storageBytes)}</span><span className="dashboard-field"><span>Provider</span><Recorded value={document.storageProvider === 'r2' ? 'Cloudflare R2' : document.storageProvider === 'local' ? 'Local' : null} /></span></td>
+          <td><span className="dashboard-field"><span>Name</span><Recorded value={document.hostName} /></span><span className="dashboard-field"><span>Profile ID</span><Recorded value={document.provenance?.hostId} /></span></td>
+          <td><span className="dashboard-field"><span>IP</span><Recorded value={document.provenance?.ipAddress} /></span><span className="dashboard-field"><span>Country</span><Recorded value={document.provenance?.countryCode} /></span><details className="dashboard-user-agent"><summary>User agent</summary><Recorded value={document.provenance?.userAgent} /></details></td>
+          <td><span className="dashboard-field"><span>Uploaded</span><Timestamp value={document.uploadedAt} /></span><span className="dashboard-field"><span>Last access</span><Timestamp value={document.lastAccessedAt} /></span></td>
+          <td><button type="button" className="secondary-button dashboard-delete" disabled={!!deletingId} onClick={() => void remove(document)} aria-label={`Delete ${document.title}`}>{deletingId === document.id ? 'Deleting…' : 'Delete'}</button></td>
         </tr>)}</tbody></table></div>
-        <div className="dashboard-pagination"><span>{documents.value.offset + 1}–{documents.value.offset + documents.value.documents.length} of {documents.value.total}</span><div><button type="button" className="secondary-button" disabled={offset === 0} onClick={() => setOffset(value => Math.max(0, value - PAGE_SIZE))}>Previous</button><button type="button" className="secondary-button" disabled={offset + PAGE_SIZE >= documents.value.total} onClick={() => setOffset(value => value + PAGE_SIZE)}>Next</button></div></div>
-      </>)}
+        <div className="dashboard-pagination"><span>{documents.value.offset + 1}–{documents.value.offset + documents.value.documents.length} of {documents.value.total}</span><div><button type="button" className="secondary-button" disabled={offset === 0 || !!deletingId} onClick={() => setOffset(value => Math.max(0, value - PAGE_SIZE))}>Previous</button><button type="button" className="secondary-button" disabled={offset + PAGE_SIZE >= documents.value.total || !!deletingId} onClick={() => setOffset(value => value + PAGE_SIZE)}>Next</button></div></div>
+      </>}</>}
     </main>}
   </div>;
 }

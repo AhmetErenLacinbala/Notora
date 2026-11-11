@@ -102,7 +102,7 @@ export async function resolveExistingUpload(record: LocalDocumentRecord, require
   return current;
 }
 
-async function shareOnce(id: string, onProgress?: (percent: number) => void, hostName?: string): Promise<UploadResult> {
+async function shareOnce(id: string, onProgress?: (percent: number) => void, hostName?: string, hostId?: string): Promise<UploadResult> {
   const run = async (): Promise<UploadResult> => {
     const record = await getLocalDocument(id);
     if (!record) throw new Error('This local PDF is unavailable.');
@@ -111,7 +111,7 @@ async function shareOnce(id: string, onProgress?: (percent: number) => void, hos
     const blob = await getLocalBlob(id);
     if (!blob) throw new Error('This local PDF is missing from browser storage.');
     const file = new File([blob], `${record.title}.pdf`, { type: 'application/pdf' });
-    const result = await uploadPdf(file, onProgress, hostName);
+    const result = await uploadPdf(file, onProgress, hostName, hostId);
     // The upload is already durable when the API returns. Persist its mapping
     // before any manifest polling or route transition so retries reuse it.
     await saveLocalUploadAndOwned({ ...matched, upload: result }, {
@@ -126,10 +126,10 @@ async function shareOnce(id: string, onProgress?: (percent: number) => void, hos
   return run();
 }
 
-export function uploadLocalDocument(id: string, onProgress?: (percent: number) => void, hostName?: string): Promise<UploadResult> {
+export function uploadLocalDocument(id: string, onProgress?: (percent: number) => void, hostName?: string, hostId?: string): Promise<UploadResult> {
   const existing = uploading.get(id);
   if (existing) return existing;
-  const promise = shareOnce(id, onProgress, hostName).finally(() => uploading.delete(id));
+  const promise = shareOnce(id, onProgress, hostName, hostId).finally(() => uploading.delete(id));
   uploading.set(id, promise);
   return promise;
 }

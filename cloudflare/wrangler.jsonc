@@ -1,0 +1,13 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "notora-storage",
+  "workers_dev": true,
+  "preview_urls": false,
+  "main": "index.ts",
+  "compatibility_date": "2026-11-10",
+  "durable_objects": {
+    "bindings": [{ "name": "QUOTA", "class_name": "StorageQuota" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["StorageQuota"] }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "notora-documents" }]
+}

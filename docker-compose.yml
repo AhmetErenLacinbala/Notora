@@ -14,6 +14,9 @@ services:
       DASHBOARD_PASSWORD_HASH: ${DASHBOARD_PASSWORD_HASH:-}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-256}
       MAX_STORAGE_MB: ${MAX_STORAGE_MB:-2048}
+      TRUST_PROXY: ${TRUST_PROXY:-}
+      R2_GATEWAY_URL: ${R2_GATEWAY_URL:-}
+      R2_GATEWAY_SECRET: ${R2_GATEWAY_SECRET:-}
     volumes:
       - notora-data:/data
     networks:
@@ -23,6 +26,7 @@ services:
     cap_drop:
       - ALL
     mem_limit: 768m
+    memswap_limit: 768m
     cpus: 0.75
     pids_limit: 96
     stop_grace_period: 30s

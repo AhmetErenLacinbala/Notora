@@ -64,6 +64,7 @@ describe('drawing relay', () => {
   it('forwards consecutive completed strokes in order, including one across a page boundary', async () => {
     const app = Fastify();
     const store = {
+      beginSession() { return () => {}; },
       authorize(documentId: string, accessToken: string) {
         if (documentId !== 'document' || accessToken !== 'access') return null;
         return { record: { manifest: { pageCount: 2 } }, owner: false };
@@ -114,6 +115,7 @@ describe('drawing relay', () => {
   it('validates drawing index/body and bounds preview deltas while routing geometry to an offscreen owner', async () => {
     const app = Fastify();
     const store = {
+      beginSession() { return () => {}; },
       authorize(documentId: string, accessToken: string, ownerToken?: string) {
         if (documentId !== 'document' || accessToken !== 'access' || ownerToken && ownerToken !== 'owner') return null;
         return { record: { manifest: { pageCount: 2 } }, owner: ownerToken === 'owner' };

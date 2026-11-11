@@ -145,7 +145,7 @@ function putChunk(
   });
 }
 
-export async function uploadPdf(file: File, onProgress?: (percent: number) => void, hostName?: string): Promise<UploadResult> {
+export async function uploadPdf(file: File, onProgress?: (percent: number) => void, hostName?: string, hostId?: string): Promise<UploadResult> {
   if (!Number.isSafeInteger(file.size) || file.size <= 0) throw new ApiError('Choose a nonempty PDF.');
   let reported = -1;
   const report = (bytes: number, complete = false): void => {
@@ -158,7 +158,7 @@ export async function uploadPdf(file: File, onProgress?: (percent: number) => vo
 
   const opened = await retryTransient(() => uploadJson('/api/uploads', 201, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ filename: file.name, size: file.size, hostName }),
+    body: JSON.stringify({ filename: file.name, size: file.size, hostName, hostId }),
   }));
   if (typeof opened !== 'object' || opened === null || !('uploadId' in opened) ||
       typeof opened.uploadId !== 'string' || !opened.uploadId ||

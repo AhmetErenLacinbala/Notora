@@ -186,7 +186,7 @@ function LocalDocumentRoute({ id, profile, onHome, onRemote, initialView }: { id
     setUploadError('');
     setUploadState({ status: 'uploading', progress: 0 });
     try {
-      const result = await uploadLocalDocument(id, progress => setUploadState({ status: 'uploading', progress }), profile.name);
+      const result = await uploadLocalDocument(id, progress => setUploadState({ status: 'uploading', progress }), profile.name, profile.id);
       setUploadState({ status: 'processing', progress: 100 });
       await beforeTransition?.();
       onRemote(result);

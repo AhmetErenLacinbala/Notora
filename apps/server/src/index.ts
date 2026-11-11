@@ -1,15 +1,18 @@
-import { createReadStream, existsSync } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Fastify, { type FastifyInstance } from 'fastify';
 import multipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
-import { MAX_UPLOAD_CHUNK_BYTES } from '../../../packages/shared/src/index.ts';
+import { MAX_UPLOAD_CHUNK_BYTES, type UploadProvenance } from '../../../packages/shared/src/index.ts';
 import { defaultPdfTools, type PdfTools } from './pdf.ts';
 import { attachRelay } from './relay.ts';
 import { DocumentStore, UploadError } from './store.ts';
 import { attachDashboard, DashboardCatalog, type DashboardOptions } from './dashboard.ts';
+import { GatewayError, R2Gateway } from './r2.ts';
+import type { FastifyRequest } from 'fastify';
 
 interface Options {
   dataDir?: string;
@@ -19,6 +22,30 @@ interface Options {
   revision?: string;
   pdfTools?: PdfTools;
   dashboard?: DashboardOptions;
+  r2Gateway?: R2Gateway;
+}
+
+const require = createRequire(import.meta.url);
+let countryLookup: ((ip: string) => { country?: string } | null) | undefined;
+try {
+  countryLookup = (require('geoip-country') as { lookup: typeof countryLookup }).lookup;
+} catch { /* Country is unknown when the local database is unavailable. */ }
+
+function uploadProvenance(request: FastifyRequest, hostId?: unknown): UploadProvenance {
+  if (hostId !== undefined && hostId !== null
+    && (typeof hostId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(hostId))) {
+    throw new UploadError(400, 'Invalid host ID');
+  }
+  const ipAddress = request.ip || null;
+  const country = ipAddress ? countryLookup?.(ipAddress)?.country : undefined;
+  const userAgent = request.headers['user-agent'];
+  return {
+    hostId: typeof hostId === 'string' ? hostId : null,
+    ipAddress,
+    countryCode: country && /^[A-Z]{2}$/.test(country) ? country : null,
+    userAgent: typeof userAgent === 'string'
+      ? userAgent.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 512) || null : null,
+  };
 }
 
 function positiveMegabytes(value: number | undefined, fallback: number): number {
@@ -35,6 +62,7 @@ function bearer(header: unknown): string | null {
 
 function routeError(error: unknown): { statusCode: number; message: string; offset?: number } {
   if (error instanceof UploadError) return { statusCode: error.statusCode, message: error.message, offset: error.offset };
+  if (error instanceof GatewayError) return { statusCode: error.statusCode, message: error.message };
   const code = (error as { code?: string }).code;
   if (code === 'FST_REQ_FILE_TOO_LARGE') return { statusCode: 413, message: 'PDF exceeds upload limit' };
   if (code === 'FST_FILES_LIMIT' || code === 'FST_FIELDS_LIMIT' || code === 'FST_PARTS_LIMIT') {
@@ -53,13 +81,18 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
   const maxUploadBytes = positiveMegabytes(options.maxUploadMb ?? Number(process.env.MAX_UPLOAD_MB || 256), 256);
   const storageBudgetBytes = positiveMegabytes(options.storageBudgetMb ?? Number(process.env.MAX_STORAGE_MB || 2048), 2048);
   const revision = options.revision ?? process.env.REVISION ?? 'dev';
-  const store = new DocumentStore(dataDir, maxUploadBytes, storageBudgetBytes, options.pdfTools ?? defaultPdfTools());
+  await mkdir(dataDir, { recursive: true });
+  const r2 = options.r2Gateway ?? (process.env.R2_GATEWAY_URL && process.env.R2_GATEWAY_SECRET
+    ? new R2Gateway(dataDir, process.env.R2_GATEWAY_URL, process.env.R2_GATEWAY_SECRET) : undefined);
+  if ((process.env.R2_GATEWAY_URL || process.env.R2_GATEWAY_SECRET) && !r2) throw new Error('Incomplete R2 gateway configuration');
+  const store = new DocumentStore(dataDir, maxUploadBytes, storageBudgetBytes, options.pdfTools ?? defaultPdfTools(), r2);
   await store.initialize();
   let catalog: DashboardCatalog;
   try { catalog = new DashboardCatalog(dataDir, store.documents, options.dashboard?.now); }
   catch (error) { store.close(); throw error; }
   store.setDashboardCatalog(catalog);
-  const app = Fastify({ logger: false });
+  const trustedProxies = process.env.TRUST_PROXY?.split(',').map(value => value.trim()).filter(Boolean);
+  const app = Fastify({ logger: false, trustProxy: trustedProxies?.length ? trustedProxies : false });
 
   await app.register(multipart, {
     limits: { fileSize: maxUploadBytes, files: 1, fields: 0, parts: 1 },
@@ -83,7 +116,7 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
         count += 1;
         result = await store.upload(part.file, part.filename, () => {
           if (part.file.truncated) throw new UploadError(413, 'PDF exceeds upload limit');
-        });
+        }, uploadProvenance(request));
       }
       if (!result || count !== 1) throw new UploadError(400, 'Upload one PDF file');
       return reply.code(202).send(result);
@@ -95,8 +128,9 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
 
   app.post('/api/uploads', async (request, reply) => {
     try {
-      const body = request.body as { filename?: unknown; size?: unknown; hostName?: unknown } | null;
-      const session = await store.createUploadSession(body?.filename, body?.size, body?.hostName);
+      const body = request.body as { filename?: unknown; size?: unknown; hostName?: unknown; hostId?: unknown } | null;
+      const session = await store.createUploadSession(body?.filename, body?.size, body?.hostName,
+        uploadProvenance(request, body?.hostId));
       return reply.code(201).send(session);
     } catch (error) {
       const response = routeError(error);
@@ -168,7 +202,11 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
     if (typeof ownerToken !== 'string' || !store.authorize(request.params.id, token, ownerToken)?.owner) {
       return reply.code(404).send({ error: 'Document unavailable' });
     }
-    try { return reply.header('Cache-Control', 'private, no-store').send(await store.fingerprint(request.params.id)); }
+    try {
+      const release = store.beginRead(request.params.id);
+      try { return reply.header('Cache-Control', 'private, no-store').send(await store.fingerprint(request.params.id)); }
+      finally { release(); }
+    }
     catch { return reply.code(503).send({ error: 'Fingerprint unavailable' }); }
   });
 
@@ -183,16 +221,36 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
         || number > manifest.pageCount || (request.query.v !== undefined && request.query.v !== manifest.version)) {
         return reply.code(404).send({ error: 'Page unavailable' });
       }
-      const path = store.pagePath(manifest.id, manifest.version, number);
-      let size: number;
-      try { size = (await stat(path)).size; } catch { return reply.code(404).send({ error: 'Page unavailable' }); }
       const etag = `"${manifest.version}-${number}"`;
-      reply.header('Content-Type', 'application/pdf');
-      reply.header('Content-Length', size);
       reply.header('ETag', etag);
-      store.recordDashboardAccess(manifest.id);
-      if (request.headers['if-none-match'] === etag) return reply.code(304).send();
-      return reply.send(createReadStream(path));
+      if (request.headers['if-none-match'] === etag) {
+        store.recordDashboardAccess(manifest.id);
+        return reply.code(304).send();
+      }
+      let release: (() => void) | undefined;
+      const abort = new AbortController();
+      try {
+        release = store.beginRead(manifest.id);
+        const finish = () => { abort.abort(); release?.(); };
+        reply.raw.once('close', finish);
+        request.raw.once('aborted', finish);
+        const page = await store.openPage(manifest.id, manifest.version, number, abort.signal);
+        if (reply.raw.destroyed || abort.signal.aborted) {
+          (page.stream as { destroy?: () => void }).destroy?.();
+          release();
+          return reply;
+        }
+        reply.header('Content-Type', 'application/pdf');
+        reply.header('Content-Length', page.size);
+        store.recordDashboardAccess(manifest.id);
+        reply.raw.once('finish', release);
+        return reply.send(page.stream);
+      } catch (error) {
+        release?.();
+        if (reply.raw.destroyed) return reply;
+        const response = routeError(error);
+        return reply.code(response.statusCode === 500 ? 404 : response.statusCode).send({ error: 'Page unavailable' });
+      }
     },
   );
 
@@ -207,10 +265,16 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
         return reply.code(404).send({ error: 'Page unavailable' });
       }
       try {
+        const release = store.beginRead(manifest.id);
+        try {
         const links = await store.pageLinks(manifest.id, manifest.version, number);
         store.recordDashboardAccess(manifest.id);
         return reply.send(links);
-      } catch { return reply.code(404).send({ error: 'Page unavailable' }); }
+        } finally { release(); }
+      } catch (error) {
+        const response = routeError(error);
+        return reply.code(response.statusCode === 500 ? 404 : response.statusCode).send({ error: 'Page unavailable' });
+      }
     },
   );
 

@@ -13,3 +13,6 @@
 - Do not change another owner's files, package manifests or lockfile without coordination. Do not commit/push/deploy from subagents.
 - Use meaningful tests for persistence, authorization, page loading, and multi-client behavior. Root verifies UI and deployment.
 - Work inside this repository. Production changes only target Notora; preserve every existing VPS application and volume.
+
+## R2 storage update
+The user now authorizes private R2 PDF storage, a protected Cloudflare quota gateway, a 9,000,000,000-byte cloud limit plus request budgets, bounded parallel page transfers, upload IP/country/profile metadata visible only to the operator, and dashboard file deletion. Read docs/r2-contract.md. Backend metadata and collaboration stay on the existing VPS; cloud gateway is the explicit exception to the single-container architecture. No paid Cloudflare upgrade. Preserve owner-only browser persistence and desktop canvas retention.

@@ -53,6 +53,7 @@ export class DashboardCatalog {
   private accessFlushTimer?: NodeJS.Timeout;
   private readonly insert;
   private readonly updateAccess;
+  private readonly deleteRecordStatement;
   private readonly now: () => number;
 
   constructor(dataDir: string, documents: ReadonlyMap<string, DocumentRecord>, now: () => number = Date.now) {
@@ -78,6 +79,7 @@ export class DashboardCatalog {
     this.updateAccess = this.db.prepare(`
       UPDATE dashboard_documents SET host_name = ?, last_accessed_at = ? WHERE id = ?
     `);
+    this.deleteRecordStatement = this.db.prepare('DELETE FROM dashboard_documents WHERE id = ?');
     for (const row of this.db.prepare('SELECT id, host_name, uploaded_at, last_accessed_at FROM dashboard_documents').all() as unknown as CatalogRow[]) {
       if (documents.has(row.id)) {
         this.metadata.set(row.id, {
@@ -108,6 +110,13 @@ export class DashboardCatalog {
     };
     this.insert.run(id, current.hostName, current.uploadedAt, current.lastAccessedAt);
     this.metadata.set(id, current);
+  }
+
+  removeRecord(id: string): void {
+    this.deleteRecordStatement.run(id);
+    this.metadata.delete(id);
+    this.pendingAccess.delete(id);
+    this.lastWrittenAt.delete(id);
   }
 
   private writeAccess(id: string): void {
@@ -151,6 +160,7 @@ export class DashboardCatalog {
   list(documents: ReadonlyMap<string, DocumentRecord>, offset: number, limit: number): DashboardDocumentsResponse {
     const entries: DashboardDocument[] = [];
     for (const record of documents.values()) {
+      if (record.deleting) continue;
       const metadata = this.metadata.get(record.manifest.id);
       entries.push({
         id: record.manifest.id,
@@ -161,6 +171,10 @@ export class DashboardCatalog {
         sizeBytes: record.uploadedBytes,
         pageCount: record.manifest.pageCount,
         status: record.manifest.status,
+        provenance: record.provenance ?? { hostId: null, ipAddress: null, countryCode: null, userAgent: null },
+        storageProvider: record.storageProvider ?? 'local',
+        storagePrefix: record.storagePrefix,
+        storageBytes: record.storageBytes,
       });
     }
     entries.sort((a, b) => (b.uploadedAt ?? -1) - (a.uploadedAt ?? -1) || b.id.localeCompare(a.id));
@@ -217,7 +231,7 @@ class DashboardAuth {
     const origin = request.headers.origin;
     if (origin !== undefined) return origin === expected;
     const fetchSite = request.headers['sec-fetch-site'];
-    return fetchSite === undefined || fetchSite === 'same-origin' || fetchSite === 'none';
+    return fetchSite === 'same-origin' || fetchSite === 'none';
   }
 
   private sessionHash(token: string): string {
@@ -347,6 +361,20 @@ export function attachDashboard(app: FastifyInstance, store: DocumentStore, cata
     const offset = pagination(request.query.offset, 0, Number.MAX_SAFE_INTEGER);
     const limit = pagination(request.query.limit, 50, 100);
     if (offset === null || limit === null || limit < 1) return reply.code(400).send({ error: 'Invalid pagination' });
-    return catalog.list(store.documents, offset, limit);
+    return { ...catalog.list(store.documents, offset, limit), storage: await store.storageBudget() };
+  });
+
+  app.delete<{ Params: { id: string } }>('/api/dashboard/documents/:id', async (request, reply) => {
+    if (!auth.configured) return unavailable(reply);
+    if (!auth.session(request)) return unauthorized(reply);
+    if (!auth.sameOrigin(request)) return reply.code(403).send({ error: 'Origin denied' });
+    try {
+      await store.deleteDocument(request.params.id);
+      return reply.code(204).send();
+    } catch (error) {
+      const status = typeof (error as { statusCode?: unknown }).statusCode === 'number'
+        ? (error as { statusCode: number }).statusCode : 503;
+      return reply.code(status).send({ error: status === 409 ? 'Document is busy' : status === 404 ? 'Document unavailable' : 'Document deletion failed' });
+    }
   });
 }
