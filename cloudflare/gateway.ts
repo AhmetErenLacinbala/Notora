@@ -445,6 +445,9 @@ export class StorageGateway {
         headers: {
           'content-type': row.content_type,
           'content-length': String(row.size),
+          // Cloudflare may remove Content-Length when it transforms or streams
+          // the response. This ledger value remains the stored object size.
+          'x-notora-object-size': String(row.size),
           etag: etag(object),
           'cache-control': 'private, no-store',
           'x-content-type-options': 'nosniff',

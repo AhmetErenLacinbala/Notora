@@ -7,7 +7,7 @@ import { pipeline } from 'node:stream/promises';
 import { MAX_UPLOAD_CHUNK_BYTES, type DocumentManifest, type PageLink, type StorageBudget, type UploadProvenance, type UploadResult, type UploadSession, type UploadStatus } from '../../../packages/shared/src/index.ts';
 import type { PdfTools } from './pdf.ts';
 import { cleanHostName } from './dashboard.ts';
-import { R2Gateway, R2_LIMIT_BYTES, type GatewayObject } from './r2.ts';
+import { GatewayError, R2Gateway, R2_LIMIT_BYTES, type GatewayObject } from './r2.ts';
 
 const ID_PATTERN = /^[0-9a-f]{32}$/;
 const PDF_HEADER = Buffer.from('%PDF-');
@@ -58,6 +58,50 @@ interface DashboardCatalogSink {
 
 export class UploadError extends Error {
   constructor(public statusCode: number, message: string, public offset?: number) { super(message); }
+}
+
+// Migration diagnostics deliberately expose only known gateway reasons and
+// filesystem error codes. Raw errors may contain absolute paths or secrets.
+const SAFE_MIGRATION_REASONS = new Set([
+  'Storage gateway unavailable', 'Invalid storage gateway status', 'Invalid storage length',
+  'Unverified storage length', 'Invalid storage response', 'Invalid storage listing',
+  'Invalid storage pending listing', 'Invalid storage pending cursor',
+  'Document storage is full', 'Monthly storage operation limit reached',
+  'Stored object size differs', 'Stored object content differs',
+  'Mismatched storage response', 'Mismatched multipart response',
+  'Multipart recovery conflict', 'Invalid multipart session',
+  'operation quota exhausted', 'storage quota exhausted', 'too many concurrent uploads',
+  'quota ledger unavailable', 'storage unavailable', 'storage reconciliation failed',
+  'request body length mismatch', 'request body too large', 'content-length required',
+  'part length mismatch', 'object key already in use', 'immutable object differs',
+  'immutable part differs', 'operation in progress', 'multipart upload incomplete',
+  'upload not writable', 'upload not completable', 'Cloud object verification failed',
+]);
+
+export class MigrationError extends Error {
+  constructor(
+    public readonly stage: string,
+    public readonly reason: string,
+    public readonly statusCode: number | null,
+  ) { super(`R2 migration failed during ${stage}: ${reason}`); }
+}
+
+function migrationFailure(stage: string, cause: unknown): MigrationError {
+  if (cause instanceof MigrationError) return cause;
+  const safeStage = /^[a-zA-Z0-9 ]{1,80}$/.test(stage) ? stage : 'migration';
+  if (cause instanceof GatewayError) {
+    return new MigrationError(safeStage,
+      SAFE_MIGRATION_REASONS.has(cause.message) ? cause.message : 'storage gateway error', cause.statusCode);
+  }
+  if (cause instanceof UploadError) return new MigrationError(safeStage, 'document unavailable or busy', cause.statusCode);
+  const code = (cause as NodeJS.ErrnoException | null)?.code;
+  if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,30}$/.test(code)) {
+    return new MigrationError(safeStage, `filesystem ${code}`, null);
+  }
+  if (cause instanceof Error && SAFE_MIGRATION_REASONS.has(cause.message)) {
+    return new MigrationError(safeStage, cause.message, null);
+  }
+  return new MigrationError(safeStage, 'unexpected error', null);
 }
 
 function hash(value: string): Buffer { return createHash('sha256').update(value).digest(); }
@@ -779,17 +823,19 @@ export class DocumentStore {
     this.migrating.add(id);
     const base = this.documentDir(id);
     const prefix = `notora/${id}/`;
+    let stage = 'preparing local files';
     try {
       const originalPath = join(base, 'original.pdf');
       const sha256 = record.manifest.contentHash ?? await this.hashFile(originalPath);
       const manifest: DocumentManifest = { ...record.manifest, contentHash: sha256 };
-      const files: Array<{ key: string; path: string; contentType: string; size: number }> = [];
+      const files: Array<{ key: string; path: string; contentType: string; size: number; label: string }> = [];
       const original = { key: `${prefix}original.pdf`, path: originalPath, contentType: 'application/pdf', size: (await stat(originalPath)).size };
       for (const page of manifest.pages) {
         const pdfPath = this.pagePath(id, manifest.version, page.number);
         const linksPath = this.linkPath(id, manifest.version, page.number);
-        files.push({ key: `${prefix}pages/${manifest.version}/${page.number}.pdf`, path: pdfPath, contentType: 'application/pdf', size: (await stat(pdfPath)).size });
-        files.push({ key: `${prefix}links/${manifest.version}/${page.number}.json`, path: linksPath, contentType: 'application/json', size: (await stat(linksPath)).size });
+        const pageLabel = Number.isSafeInteger(page.number) ? String(page.number) : 'unknown';
+        files.push({ key: `${prefix}pages/${manifest.version}/${page.number}.pdf`, path: pdfPath, contentType: 'application/pdf', size: (await stat(pdfPath)).size, label: `page PDF ${pageLabel}` });
+        files.push({ key: `${prefix}links/${manifest.version}/${page.number}.json`, path: linksPath, contentType: 'application/json', size: (await stat(linksPath)).size, label: `page links ${pageLabel}` });
       }
       const manifestData = Buffer.from(JSON.stringify(manifest));
       const metadataData = Buffer.from(JSON.stringify({
@@ -797,22 +843,34 @@ export class DocumentStore {
         uploadedBytes: record.uploadedBytes, createdAt: record.createdAt,
         hostName: record.hostName, provenance: record.provenance,
       }));
+      stage = 'uploading original PDF';
       await this.r2.putFile(original.key, original.path, original.contentType);
-      await this.pool3(files, file => this.r2!.putFile(file.key, file.path, file.contentType));
-      await Promise.all([
-        this.r2.putBytes(`${prefix}manifest.json`, manifestData, 'application/json'),
-        this.r2.putBytes(`${prefix}metadata.json`, metadataData, 'application/json'),
-      ]);
-      const expected: GatewayObject[] = [
-        { key: original.key, size: original.size },
-        ...files.map(file => ({ key: file.key, size: file.size })),
-        { key: `${prefix}manifest.json`, size: manifestData.length },
-        { key: `${prefix}metadata.json`, size: metadataData.length },
-      ];
-      await this.pool3(expected, async object => {
-        const head = await this.r2!.headObject(object.key);
-        if (!head || head.size !== object.size) throw new Error('Cloud object verification failed');
+      stage = 'uploading page objects';
+      await this.pool3(files, async file => {
+        try { await this.r2!.putFile(file.key, file.path, file.contentType); }
+        catch (error) { throw migrationFailure(`uploading ${file.label}`, error); }
       });
+      stage = 'uploading metadata';
+      await Promise.all([
+        this.r2.putBytes(`${prefix}manifest.json`, manifestData, 'application/json')
+          .catch(error => { throw migrationFailure('uploading manifest', error); }),
+        this.r2.putBytes(`${prefix}metadata.json`, metadataData, 'application/json')
+          .catch(error => { throw migrationFailure('uploading private metadata', error); }),
+      ]);
+      const expected: Array<GatewayObject & { label: string }> = [
+        { key: original.key, size: original.size, label: 'original PDF' },
+        ...files.map(file => ({ key: file.key, size: file.size, label: file.label })),
+        { key: `${prefix}manifest.json`, size: manifestData.length, label: 'manifest' },
+        { key: `${prefix}metadata.json`, size: metadataData.length, label: 'private metadata' },
+      ];
+      stage = 'verifying cloud objects';
+      await this.pool3(expected, async object => {
+        try {
+          const head = await this.r2!.headObject(object.key);
+          if (!head || head.size !== object.size) throw new Error('Cloud object verification failed');
+        } catch (error) { throw migrationFailure(`verifying ${object.label}`, error); }
+      });
+      stage = 'committing cloud record';
       const nextRecord: DocumentRecord = {
         ...record, manifest, storageProvider: 'r2', storagePrefix: prefix,
         storageBytes: expected.reduce((sum, object) => sum + object.size, 0),
@@ -821,9 +879,11 @@ export class DocumentStore {
       await writeJsonDurable(join(base, 'record.json'), nextRecord);
       this.documents.set(id, nextRecord);
       this.cloudPendingBytes -= record.cloudPendingBytes ?? 0;
+      stage = 'cleaning local binaries';
       await this.cleanupMigratedLocal(id);
       return true;
-    } finally { this.migrating.delete(id); }
+    } catch (error) { throw migrationFailure(stage, error); }
+    finally { this.migrating.delete(id); }
   }
 
   private async cleanupMigratedLocal(id: string): Promise<void> {

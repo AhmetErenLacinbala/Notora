@@ -149,6 +149,34 @@ async function upload(app: FastifyInstance, hostId?: string): Promise<UploadResu
 }
 
 describe('R2 document storage', () => {
+  it('uses authoritative object sizes when Cloudflare omits Content-Length and rejects missing sizes', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'notora-r2-length-'));
+    cleanup.push(() => rm(dir, { recursive: true, force: true }));
+    let includeSize = true;
+    const gateway = new R2Gateway(dir, 'https://gateway.example', secret, async (_input, init) => {
+      expect((init?.headers as Record<string, string>)['accept-encoding']).toBe('identity');
+      const headers = new Headers({ 'content-encoding': 'br' });
+      if (includeSize) headers.set('x-notora-object-size', '20600');
+      if (init?.method === 'HEAD') return new Response(null, { status: 200, headers });
+      const body = new ReadableStream<Uint8Array>({ start(controller) {
+        controller.enqueue(new Uint8Array(20600));
+        controller.close();
+      } });
+      return new Response(body, { status: 200, headers });
+    });
+    cleanup.push(async () => gateway.close());
+    const key = `notora/${'a'.repeat(32)}/metadata.json`;
+    expect((await gateway.headObject(key))?.size).toBe(20600);
+    const object = await gateway.getObject(key);
+    expect(object.size).toBe(20600);
+    let received = 0;
+    for await (const chunk of object.stream) received += Buffer.from(chunk).length;
+    expect(received).toBe(20600);
+    includeSize = false;
+    await expect(gateway.headObject(key)).rejects.toThrow('Invalid storage length');
+    await expect(gateway.getObject(key)).rejects.toThrow('Invalid storage length');
+  });
+
   it('commits and verifies cloud objects before removing local PDFs, then serves after restart', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'notora-r2-'));
     cleanup.push(() => rm(dir, { recursive: true, force: true }));
@@ -190,6 +218,10 @@ describe('R2 document storage', () => {
     await store.waitForIdle();
     expect(store.getRecord(tokens.documentId)?.storageProvider).toBe('local');
     expect(await readFile(join(dir, 'documents', tokens.documentId, 'original.pdf'))).toEqual(pdf);
+    gateway.failNextPut = true;
+    await expect(store.migrateLocalDocument(tokens.documentId)).rejects.toMatchObject({
+      stage: 'uploading original PDF', statusCode: 503, reason: 'storage gateway error',
+    });
     const release = store.beginRead(tokens.documentId);
     const migrating = store.migrateLocalDocument(tokens.documentId);
     for (let attempt = 0; attempt < 100 && store.getRecord(tokens.documentId)?.storageProvider !== 'r2'; attempt++) {

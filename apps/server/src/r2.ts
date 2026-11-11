@@ -24,6 +24,18 @@ export class GatewayError extends Error {
 function validCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
+function objectSize(headers: Headers): number {
+  // Cloudflare may compress a response or stream it without Content-Length.
+  // The gateway's ledger-backed header is the uncompressed R2 object size.
+  const authoritative = headers.get('x-notora-object-size');
+  const raw = authoritative ?? headers.get('content-length');
+  if (raw === null || !/^(0|[1-9]\d*)$/.test(raw)) throw new GatewayError('Invalid storage length');
+  if (authoritative === null && headers.get('content-encoding')
+    && headers.get('content-encoding') !== 'identity') throw new GatewayError('Unverified storage length');
+  const size = Number(raw);
+  if (!validCount(size)) throw new GatewayError('Invalid storage length');
+  return size;
+}
 function safeKey(key: string): string {
   if (!KEY_PATTERN.test(key) || key.split('/').some(segment => segment === '.' || segment === '..')) {
     throw new GatewayError('Invalid storage key', 400);
@@ -94,7 +106,7 @@ export class R2Gateway {
     if (transfer) await this.acquireTransfer();
     try {
       return await this.fetcher(`${this.base}${path}`, {
-        ...init, headers: { authorization: `Bearer ${this.secret}`, ...init.headers },
+        ...init, headers: { authorization: `Bearer ${this.secret}`, 'accept-encoding': 'identity', ...init.headers },
         signal: init.signal ?? AbortSignal.timeout(300_000),
       });
     } catch { throw new GatewayError('Storage gateway unavailable'); }
@@ -289,16 +301,15 @@ export class R2Gateway {
     const response = await this.request(`/v1/objects/${key}`, 'B', { method: 'HEAD' });
     if (response.status === 404) return null;
     if (!response.ok) throw await failure(response);
-    const size = Number(response.headers.get('content-length'));
-    if (!validCount(size)) throw new GatewayError('Invalid storage length');
+    const size = objectSize(response.headers);
     return { size, etag: response.headers.get('etag') };
   }
   async getObject(key: string, signal?: AbortSignal): Promise<{ stream: Readable; size: number; contentType: string; etag: string | null }> {
     safeKey(key);
     const response = await this.request(`/v1/objects/${key}`, 'B', signal ? { signal } : {});
     if (!response.ok) throw await failure(response);
-    const size = Number(response.headers.get('content-length'));
-    if (!validCount(size) || !response.body) throw new GatewayError('Invalid storage response');
+    const size = objectSize(response.headers);
+    if (!response.body) throw new GatewayError('Invalid storage response');
     return {
       stream: Readable.fromWeb(response.body as import('node:stream/web').ReadableStream), size,
       contentType: response.headers.get('content-type') ?? 'application/octet-stream',

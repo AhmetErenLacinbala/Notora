@@ -242,6 +242,9 @@ describe('private R2 gateway', () => {
     expect(bucket.calls.put).toBe(1);
     const downloaded = await call(restarted, `/v1/objects/${key('a')}`);
     expect(downloaded.headers.get('cache-control')).toContain('no-store');
+    expect(downloaded.headers.get('x-notora-object-size')).toBe('3');
+    const head = await call(restarted, `/v1/objects/${key('a')}`, 'HEAD');
+    expect(head.headers.get('x-notora-object-size')).toBe('3');
     expect(new Uint8Array(await downloaded.arrayBuffer())).toEqual(bytes);
   });
 

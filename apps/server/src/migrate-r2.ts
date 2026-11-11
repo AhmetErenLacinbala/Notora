@@ -1,4 +1,17 @@
 import { createServer } from './index.ts';
+import { MigrationError, UploadError } from './store.ts';
+
+function safeDiagnostic(error: unknown): string {
+  if (error instanceof MigrationError) {
+    return `stage=${error.stage} status=${error.statusCode ?? 'none'} reason=${error.reason}`;
+  }
+  if (error instanceof UploadError) return `stage=preflight status=${error.statusCode} reason=document unavailable or busy`;
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,30}$/.test(code)) {
+    return `stage=setup status=none reason=filesystem ${code}`;
+  }
+  return 'stage=setup status=none reason=unexpected error';
+}
 
 // Run explicitly with R2_GATEWAY_URL, R2_GATEWAY_SECRET and DATA_DIR set.
 // Optional --id=<32hex> limits the migration to one document.
@@ -23,9 +36,10 @@ try {
     try {
       if (await store.migrateLocalDocument(id)) migrated += 1;
       else skipped += 1;
-    } catch {
+    } catch (error) {
       failed += 1;
-      process.stderr.write(`R2 migration failed for document ${id}; local files remain.\n`);
+      const provider = store.getRecord(id)?.storageProvider === 'r2' ? 'r2' : 'local';
+      process.stderr.write(`R2 migration failed for document ${id}: ${safeDiagnostic(error)} provider=${provider}.\n`);
     }
   }
   process.stdout.write(JSON.stringify({ migrated, skipped, failed }) + '\n');
