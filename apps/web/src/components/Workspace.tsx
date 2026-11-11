@@ -5,7 +5,7 @@ import { canvasPoint, intersectsRect, selectionRect, wheelPixels, zoomCameraAt }
 import type { CanvasPoint, CanvasRect } from '../lib/canvasGeometry';
 import { drawingBounds, fitStroke, hitDrawing } from '../lib/drawingGeometry';
 import type { LocalPdfSource } from '../lib/localPdf';
-import { buildShareUrl } from '../lib/shareLink';
+import { buildShareUrl, buildViewUrl, cameraForSharedView, sharedViewFromCamera } from '../lib/shareLink';
 import type { SharedView } from '../lib/shareLink';
 import { loadCamera, saveCamera } from '../lib/storage';
 import { WorkspaceSession } from '../lib/workspace';
@@ -28,7 +28,6 @@ function noteWidth(text: string, fontSize: number): number {
 }
 
 function clamp(value: number, min: number, max: number) { return Math.min(max, Math.max(min, value)); }
-function validViewCoordinate(value: number | undefined): value is number { return typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= 10_000_000; }
 
 function stageSize(pages: PageLayout[]) {
   const maxWidth = pages.reduce((max, page) => Math.max(max, page.width), 0);
@@ -160,6 +159,7 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
   const [shareCopied, setShareCopied] = useState(false);
   const [shareBusy, setShareBusy] = useState(false);
   const [shareActionError, setShareActionError] = useState<string | null>(null);
+  const [locationReady, setLocationReady] = useState(false);
   const [tool, setTool] = useState<Tool>(null);
   const [camera, setCameraState] = useState<Camera>({ scrollLeft: 0, scrollTop: 0, zoom: 1 });
   const cameraRef = useRef(camera);
@@ -185,6 +185,8 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
   const [marquee, setMarquee] = useState<CanvasRect | null>(null);
   const lastMarqueeEnd = useRef(0);
   const cameraTimer = useRef<number | undefined>(undefined);
+  const locationTimer = useRef<number | undefined>(undefined);
+  const lastLocationAttempt = useRef(-Infinity);
   const cursorFrame = useRef<number | undefined>(undefined);
   const pendingCursor = useRef<CursorPosition | null>(null);
   const lastClientPointer = useRef<CanvasPoint | null>(null);
@@ -195,6 +197,51 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
   const drawingsRef = useRef<DrawingShape[]>(snapshot.drawings);
   drawingsRef.current = snapshot.drawings;
   const cameraStorageId = storageId ?? manifest.id;
+
+  const locationUrl = useCallback((): string | null => {
+    const viewport = viewportRef.current;
+    if (!viewport || !pages.length) return null;
+    const path = window.location.pathname.replace(/\/$/, '');
+    const localPath = '/local/' + encodeURIComponent(localPdf?.manifest.id ?? manifest.id);
+    const remotePath = '/r/' + encodeURIComponent(manifest.id);
+    if (localOnly ? path !== localPath : path !== remotePath && (!localPdf || path !== localPath)) return null;
+    const view = sharedViewFromCamera(pages, cameraRef.current, { width: viewport.clientWidth, height: viewport.clientHeight });
+    return localOnly
+      ? buildViewUrl(window.location.href, view)
+      : buildShareUrl(window.location.origin, manifest.id, accessToken, view);
+  }, [accessToken, localOnly, localPdf, manifest.id, pages, storageId]);
+
+  const writeLocation = useCallback((): string | null => {
+    if (!cameraReady.current) return null;
+    const url = locationUrl();
+    if (!url) return null;
+    const now = performance.now();
+    lastLocationAttempt.current = now;
+    try {
+      if (url !== window.location.href) window.history.replaceState(window.history.state, '', url);
+    } catch {
+      // Browsers may rate-limit History API calls; keep camera interaction responsive.
+    }
+    return url;
+  }, [locationUrl]);
+
+  const flushLocation = useCallback((): string | null => {
+    if (locationTimer.current !== undefined) {
+      window.clearTimeout(locationTimer.current);
+      locationTimer.current = undefined;
+    }
+    return writeLocation();
+  }, [writeLocation]);
+
+  const scheduleLocation = useCallback(() => {
+    if (!cameraReady.current || locationTimer.current !== undefined) return;
+    const delay = Math.max(0, 500 - (performance.now() - lastLocationAttempt.current));
+    if (delay === 0) { writeLocation(); return; }
+    locationTimer.current = window.setTimeout(() => {
+      locationTimer.current = undefined;
+      writeLocation();
+    }, delay);
+  }, [writeLocation]);
 
   const saveCurrentCamera = useCallback(() => {
     if (!cameraReady.current) return;
@@ -228,12 +275,19 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
     cameraRef.current = next;
     setCameraState(next);
     saveCurrentCamera();
+    scheduleLocation();
     const pointer = lastClientPointer.current;
     if (pointer) queuePointerCursor(pointer.x, pointer.y);
-  }, [queuePointerCursor, saveCurrentCamera]);
+  }, [queuePointerCursor, saveCurrentCamera, scheduleLocation]);
 
   useEffect(() => {
     let live = true;
+    cameraReady.current = false;
+    setLocationReady(false);
+    if (locationTimer.current !== undefined) {
+      window.clearTimeout(locationTimer.current);
+      locationTimer.current = undefined;
+    }
     void loadCamera(cameraStorageId).then(camera => {
       if (!live) return;
       const requestedZoom = Number.isFinite(initialView?.zoom) ? initialView!.zoom! : camera?.zoom ?? 1;
@@ -243,23 +297,15 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
         const element = viewportRef.current;
         const first = pages[0];
         const defaultLeft = first ? (first.x + first.width / 2) * initialZoom - element.clientWidth / 2 : 0;
-        let next = {
+        const next = cameraForSharedView(pages, initialView, { width: element.clientWidth, height: element.clientHeight }, initialZoom) ?? {
           scrollLeft: Number.isFinite(camera?.scrollLeft) ? camera!.scrollLeft : defaultLeft,
           scrollTop: Number.isFinite(camera?.scrollTop) ? camera!.scrollTop : 0,
           zoom: initialZoom,
         };
-        const viewPage = initialView && Number.isSafeInteger(initialView.page) ? pages[initialView.page - 1] : undefined;
-        if (viewPage) {
-          const centerX = validViewCoordinate(initialView?.x) ? initialView!.x! : viewPage.width / 2;
-          const centerY = validViewCoordinate(initialView?.y) ? initialView!.y! : element.clientHeight / (2 * initialZoom);
-          next = {
-            scrollLeft: (viewPage.x + centerX) * initialZoom - element.clientWidth / 2,
-            scrollTop: (viewPage.y + centerY) * initialZoom - element.clientHeight / 2,
-            zoom: initialZoom,
-          };
-        }
         applyCamera(next);
         cameraReady.current = true;
+        setLocationReady(true);
+        flushLocation();
       });
     }).catch(() => {
       if (!live) return;
@@ -268,31 +314,34 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
         if (!live || !element) return;
         const first = pages[0];
         const fallbackZoom = clamp(Number.isFinite(initialView?.zoom) ? initialView!.zoom! : 1, MIN_ZOOM, MAX_ZOOM);
-        const viewPage = initialView && Number.isSafeInteger(initialView.page) ? pages[initialView.page - 1] : undefined;
-        const next = viewPage ? {
-          scrollLeft: (viewPage.x + (validViewCoordinate(initialView?.x) ? initialView!.x! : viewPage.width / 2)) * fallbackZoom - element.clientWidth / 2,
-          scrollTop: (viewPage.y + (validViewCoordinate(initialView?.y) ? initialView!.y! : element.clientHeight / (2 * fallbackZoom))) * fallbackZoom - element.clientHeight / 2,
-          zoom: fallbackZoom,
-        } : { scrollLeft: first ? (first.x + first.width / 2) * fallbackZoom - element.clientWidth / 2 : 0, scrollTop: 0, zoom: fallbackZoom };
+        const next = cameraForSharedView(pages, initialView, { width: element.clientWidth, height: element.clientHeight }, fallbackZoom)
+          ?? { scrollLeft: first ? (first.x + first.width / 2) * fallbackZoom - element.clientWidth / 2 : 0, scrollTop: 0, zoom: fallbackZoom };
         applyCamera(next);
         cameraReady.current = true;
+        setLocationReady(true);
+        flushLocation();
       });
     });
     return () => { live = false; };
-  }, [cameraStorageId, pages, applyCamera, initialView?.page, initialView?.x, initialView?.y, initialView?.zoom]);
+  }, [cameraStorageId, pages, applyCamera, flushLocation, initialView?.page, initialView?.x, initialView?.y, initialView?.zoom]);
 
   useLayoutEffect(() => {
     const element = viewportRef.current;
     if (!element) return;
-    const updateSize = () => setViewportSize(previous => {
+    let lastWidth = -1, lastHeight = -1;
+    const updateSize = () => {
       const width = element.clientWidth, height = element.clientHeight;
-      return previous.width === width && previous.height === height ? previous : { width, height };
-    });
+      if (width === lastWidth && height === lastHeight) return;
+      lastWidth = width;
+      lastHeight = height;
+      setViewportSize({ width, height });
+      scheduleLocation();
+    };
     const observer = new ResizeObserver(updateSize);
     observer.observe(element);
     updateSize();
     return () => observer.disconnect();
-  }, []);
+  }, [scheduleLocation]);
 
   useEffect(() => {
     const media = window.matchMedia('(hover: hover) and (pointer: fine)');
@@ -315,6 +364,7 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
 
   useEffect(() => () => {
     if (cameraTimer.current) window.clearTimeout(cameraTimer.current);
+    if (locationTimer.current !== undefined) window.clearTimeout(locationTimer.current);
     if (cursorFrame.current) cancelAnimationFrame(cursorFrame.current);
     if (cameraReady.current) void saveCamera(cameraStorageId, cameraRef.current);
     if (activeDrawing.current) session.sendDrawingPreview(null);
@@ -869,20 +919,16 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
 
   const currentShareView = (): SharedView => {
     const viewport = viewportRef.current;
-    const current = cameraRef.current;
-    const centerX = (current.scrollLeft + (viewport?.clientWidth ?? viewportSize.width) / 2) / current.zoom;
-    const centerY = (current.scrollTop + (viewport?.clientHeight ?? viewportSize.height) / 2) / current.zoom;
-    const page = nearestPage(pages, centerY) ?? pages[0];
-    return page ? {
-      page: page.number,
-      x: clamp(centerX - page.x, -10_000_000, 10_000_000),
-      y: clamp(centerY - page.y, -10_000_000, 10_000_000),
-      zoom: current.zoom,
-    } : { page: 1, zoom: current.zoom };
+    return sharedViewFromCamera(pages, cameraRef.current, {
+      width: viewport?.clientWidth ?? viewportSize.width,
+      height: viewport?.clientHeight ?? viewportSize.height,
+    });
   };
-  const shareUrl = localOnly ? '' : buildShareUrl(window.location.origin, manifest.id, accessToken, currentShareView());
+  const shareUrl = localOnly || !locationReady ? '' : buildShareUrl(window.location.origin, manifest.id, accessToken, currentShareView());
+  useEffect(() => { setShareCopied(false); }, [shareUrl]);
   const copyShare = async () => {
-    const currentUrl = buildShareUrl(window.location.origin, manifest.id, accessToken, currentShareView());
+    if (!locationReady) return;
+    const currentUrl = flushLocation() ?? buildShareUrl(window.location.origin, manifest.id, accessToken, currentShareView());
     try { await navigator.clipboard.writeText(currentUrl); setShareCopied(true); }
     catch { setShareCopied(false); setShareOpen(true); }
   };
@@ -893,9 +939,11 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
     try {
       await session.flush();
       await saveCamera(cameraStorageId, cameraRef.current);
+      flushLocation();
       await onUpload(async () => {
         await session.flush();
         await saveCamera(cameraStorageId, cameraRef.current);
+        flushLocation();
       });
     } catch (error) {
       setShareActionError(error instanceof Error ? error.message : 'This file could not be uploaded.');
@@ -930,7 +978,7 @@ function WorkspaceContent({ manifest, accessToken, onHome, storageId, localOnly,
         </div>
         <div className="zoom-group" aria-label="Zoom controls"><button type="button" aria-label="Zoom out" disabled={zoom <= MIN_ZOOM} onClick={() => changeZoom(zoom - ZOOM_STEP)}>−</button><span>{Math.round(zoom * 100)}%</span><button type="button" aria-label="Zoom in" disabled={zoom >= MAX_ZOOM} onClick={() => changeZoom(zoom + ZOOM_STEP)}>+</button></div>
         <div className="topbar-separator share-separator" />
-        <div className="share-wrap"><button type="button" className="toolbar-button share-button" aria-expanded={shareOpen} onClick={() => { setShareOpen(value => !value); setShareCopied(false); setShareActionError(null); }}>Share</button>{shareOpen && <div className="share-popover"><strong>Share this PDF</strong>{localOnly ? <><p>Upload this file to create a link for collaborators.</p><button type="button" className="primary-button share-upload-button" disabled={!onUpload || shareBusy || !!uploadState} onClick={() => void uploadFromShare()}>Upload this file</button>{uploadState && <div className="share-upload-state" role="status">{uploadState.status === 'uploading' ? `Uploading… ${Math.round(uploadState.progress)}%` : 'Processing PDF…'}</div>}{(shareActionError || uploadError) && <p className="form-error share-error" role="alert">{shareActionError || uploadError}</p>}</> : <><p>Anyone with this link can read and write notes. The link opens at your current location.</p><div className="share-link-row"><input aria-label="Share link" readOnly value={shareUrl} onFocus={event => event.currentTarget.select()} /><button type="button" onClick={() => void copyShare()}>{shareCopied ? 'Copied' : 'Copy'}</button></div></>}</div>}</div>
+        <div className="share-wrap"><button type="button" className="toolbar-button share-button" aria-expanded={shareOpen} onClick={() => { if (!shareOpen) flushLocation(); setShareOpen(value => !value); setShareCopied(false); setShareActionError(null); }}>Share</button>{shareOpen && <div className="share-popover"><strong>Share this PDF</strong>{localOnly ? <><p>Upload this file to create a link for collaborators.</p><button type="button" className="primary-button share-upload-button" disabled={!onUpload || shareBusy || !!uploadState} onClick={() => void uploadFromShare()}>Upload this file</button>{uploadState && <div className="share-upload-state" role="status">{uploadState.status === 'uploading' ? `Uploading… ${Math.round(uploadState.progress)}%` : 'Processing PDF…'}</div>}{(shareActionError || uploadError) && <p className="form-error share-error" role="alert">{shareActionError || uploadError}</p>}</> : <><p>Anyone with this link can read and write notes. The link opens at your current location.</p><div className="share-link-row"><input aria-label="Share link" readOnly value={shareUrl} placeholder={locationReady ? undefined : 'Locating…'} onFocus={event => event.currentTarget.select()} /><button type="button" disabled={!locationReady} onClick={() => void copyShare()}>{shareCopied ? 'Copied' : 'Copy'}</button></div></>}</div>}</div>
       </div>
       <div className="workspace-presence"><div className="participant-list" aria-label="Participants">{snapshot.participants.map(participant => <button key={participant.clientId} type="button" className="participant-pill" title={participant.cursor ? `Jump to ${participant.name}` : participant.name} aria-label={participant.cursor ? `Jump to ${participant.name}` : participant.name} disabled={!participant.cursor} onClick={() => jumpToCursor(participant.cursor)}><span className="participant-avatar" style={{ backgroundColor: participant.color }}>{participant.name.slice(0, 1).toUpperCase()}</span><span className="participant-name">{participant.name}</span></button>)}</div><span className={`connection-indicator ${snapshot.connection}`} title={snapshot.connection} /><span className={`save-status ${snapshot.saveState}`} role="status" title={snapshot.error || undefined}>{saveLabel}</span></div>
     </header>

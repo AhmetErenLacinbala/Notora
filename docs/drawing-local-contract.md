@@ -32,6 +32,8 @@ Root adds authenticated GET /api/documents/:id/fingerprint returning {sha256,siz
 ## Share location
 Root supplies SharedView {page:number;x?:number;y?:number;zoom?:number}; parseSharedView(search:string):SharedView|undefined; buildShareUrl(origin,id,token,view):string. URL query has page plus optional page-relative center x/y and zoom, capability remains fragment. UI builds location from current viewport center at share/copy time, initialView overrides saved camera once on entry; validate/clamp page/zoom. Page navigation links retain original numbering. App parses URL and passes initialView.
 
+Address bar and Share links track the same current viewport center and zoom. Use `history.replaceState` with throttled trailing updates, preserving the existing history state and avoiding a history entry per pan/zoom. Shared documents use the canonical `/r/:id` capability URL even when the creator is rendering a previously uploaded local Blob; unuploaded files stay on `/local/:id` and never upload implicitly. Query location is captured at navigation, applies to both routes, overrides a saved camera, and survives the name prompt and local-to-shared transition. Do not write a default camera to the URL before restoration completes. Cancel pending URL writes on unmount so they cannot overwrite a subsequent route.
+
 ## Verification
 Meaningful tests for geometric approximation/corners/duplicates/encoding, drawing save/reconnect/owner offscreen updates/delete, preview validation, share URL validation, local identity/reuse/migration. Root verifies UI locally; user explicitly said no live-site checks. No subagent commits, pushes, deploys, or builds while browser verification is running.
 

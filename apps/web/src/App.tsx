@@ -3,26 +3,27 @@ import type { DocumentManifest, OwnedProject, Profile } from '../../../packages/
 import { getManifest } from './lib/api';
 import { importLocalFile, resolveExistingUpload, uploadLocalDocument } from './lib/localDocuments';
 import type { LocalPdfSource } from './lib/localPdf';
-import { parseSharedView } from './lib/shareLink';
+import { buildViewUrl, parseSharedView, type SharedView } from './lib/shareLink';
 import { getLocalBlob, getLocalDocument, getOwnedProject, getProfile, listLocalDocuments, listOwnedProjects, saveOwnedProject, saveProfile, updateLocalManifest, type LocalDocumentRecord } from './lib/storage';
 
 const Workspace = lazy(async () => ({ default: (await import('./components/Workspace')).Workspace }));
 
-type Route = { kind: 'remote'; documentId: string; token: string } | { kind: 'local'; id: string } | null;
+type Route = { kind: 'remote'; documentId: string; token: string; view?: SharedView } | { kind: 'local'; id: string; view?: SharedView } | null;
 type Recent = { kind: 'local'; record: LocalDocumentRecord } | { kind: 'remote'; project: OwnedProject };
 
 function currentRoute(): Route {
   const local = window.location.pathname.match(/^\/local\/(local-[a-f0-9]{64})\/?$/);
-  if (local) return { kind: 'local', id: local[1] };
+  if (local) return { kind: 'local', id: local[1], view: parseSharedView(window.location.search) };
   const remote = window.location.pathname.match(/^\/r\/([A-Za-z0-9_-]+)\/?$/);
   if (!remote) return null;
   let token = window.location.hash.slice(1);
   try { token = decodeURIComponent(token); } catch { /* API rejects malformed fragments */ }
-  return { kind: 'remote', documentId: remote[1], token };
+  return { kind: 'remote', documentId: remote[1], token, view: parseSharedView(window.location.search) };
 }
 
 function routeUrl(route: NonNullable<Route>): string {
-  return route.kind === 'local' ? `/local/${route.id}` : `/r/${encodeURIComponent(route.documentId)}#${encodeURIComponent(route.token)}`;
+  const path = route.kind === 'local' ? `/local/${route.id}` : `/r/${encodeURIComponent(route.documentId)}#${encodeURIComponent(route.token)}`;
+  return route.view ? buildViewUrl(new URL(path, window.location.origin).href, route.view) : path;
 }
 
 function errorText(error: unknown): string {
@@ -104,7 +105,7 @@ export default function App() {
   if (profile === undefined) return <div className="app-loading" aria-label="Loading Notora">notora<span>.</span></div>;
   if (profile === null) return <NameGate onSubmit={submitName} initialError={homeError} />;
   if (route?.kind === 'remote') return <DocumentRoute key={`remote:${route.documentId}`} route={route} profile={profile} onHome={() => navigate(null)} />;
-  if (route?.kind === 'local') return <LocalDocumentRoute key={`local:${route.id}`} id={route.id} profile={profile} onHome={() => navigate(null)} onRemote={result => navigate({ kind: 'remote', documentId: result.documentId, token: result.accessToken })} />;
+  if (route?.kind === 'local') return <LocalDocumentRoute key={`local:${route.id}`} id={route.id} initialView={route.view} profile={profile} onHome={() => navigate(null)} onRemote={result => navigate({ kind: 'remote', documentId: result.documentId, token: result.accessToken, view: parseSharedView(window.location.search) })} />;
 
   return <div className="home-shell">
     <header className="home-header"><span className="brand">notora<span>.</span></span><span className="home-profile">{profile.name}</span></header>
@@ -143,7 +144,7 @@ function WaitPage({ onHome, title, message, retry }: { onHome: () => void; title
   return <div className="document-wait"><header className="home-header"><button className="brand brand-button" type="button" onClick={onHome}>notora<span>.</span></button></header><main><div className="wait-mark" aria-hidden="true" /><h1>{title}</h1><p>{message}</p>{retry && <button type="button" className="secondary-button" onClick={retry}>Try again</button>}</main></div>;
 }
 
-function LocalDocumentRoute({ id, profile, onHome, onRemote }: { id: string; profile: Profile; onHome: () => void; onRemote: (result: { documentId: string; accessToken: string }) => void }) {
+function LocalDocumentRoute({ id, profile, onHome, onRemote, initialView }: { id: string; initialView?: SharedView; profile: Profile; onHome: () => void; onRemote: (result: { documentId: string; accessToken: string }) => void }) {
   const [record, setRecord] = useState<LocalDocumentRecord | null>(null);
   const [source, setSource] = useState<LocalPdfSource | null>(null);
   const [error, setError] = useState('');
@@ -193,7 +194,7 @@ function LocalDocumentRoute({ id, profile, onHome, onRemote }: { id: string; pro
 
   if (!record || !source) return <WaitPage onHome={onHome} title={error ? 'Couldn’t open this PDF' : 'Opening your PDF'} message={error || 'Reading its pages and outline locally.'} retry={error ? () => setRetry(value => value + 1) : undefined} />;
   const manifest = record.upload ? { ...source.manifest, id: record.upload.documentId } : source.manifest;
-  return <Suspense fallback={<div className="workspace-init" role="status">Opening workspace…</div>}><Workspace manifest={manifest} accessToken={record.upload?.accessToken ?? ''} ownerToken={record.upload?.ownerToken} profile={profile} onHome={onHome} storageId={record.storageId} localOnly={!record.upload} localPdf={source} onUpload={record.upload ? undefined : share} uploadState={uploadState} uploadError={uploadError} /></Suspense>;
+  return <Suspense fallback={<div className="workspace-init" role="status">Opening workspace…</div>}><Workspace manifest={manifest} accessToken={record.upload?.accessToken ?? ''} ownerToken={record.upload?.ownerToken} profile={profile} onHome={onHome} storageId={record.storageId} initialView={initialView} localOnly={!record.upload} localPdf={source} onUpload={record.upload ? undefined : share} uploadState={uploadState} uploadError={uploadError} /></Suspense>;
 }
 
 function DocumentRoute({ route, profile, onHome }: { route: Extract<Route, { kind: 'remote' }>; profile: Profile; onHome: () => void }) {
@@ -232,6 +233,6 @@ function DocumentRoute({ route, profile, onHome }: { route: Extract<Route, { kin
     return () => { live = false; if (timer) window.clearTimeout(timer); };
   }, [route.documentId, route.token, retry]);
 
-  if (manifest?.status === 'ready' && accessToken) return <Suspense fallback={<div className="workspace-init" role="status">Opening workspace…</div>}><Workspace manifest={manifest} accessToken={accessToken} ownerToken={owned?.ownerToken} profile={profile} onHome={onHome} storageId={owned?.storageId} initialView={parseSharedView(window.location.search)} /></Suspense>;
+  if (manifest?.status === 'ready' && accessToken) return <Suspense fallback={<div className="workspace-init" role="status">Opening workspace…</div>}><Workspace manifest={manifest} accessToken={accessToken} ownerToken={owned?.ownerToken} profile={profile} onHome={onHome} storageId={owned?.storageId} initialView={route.view} /></Suspense>;
   return <WaitPage onHome={onHome} title={error ? 'Couldn’t open this PDF' : manifest?.status === 'error' ? 'This PDF couldn’t be prepared' : 'Preparing your PDF'} message={error || manifest?.error || 'This can take a moment for a longer document.'} retry={error || manifest?.status === 'error' ? () => setRetry(value => value + 1) : undefined} />;
 }
