@@ -133,6 +133,8 @@ describe('Notora server', () => {
     resources.push(async () => { await app.close(); await rm(dir, { recursive: true, force: true }); });
     expect((await app.inject({ method: 'GET', url: '/' })).body).toContain('<title>Notora</title>');
     expect((await app.inject({ method: 'GET', url: '/r/example' })).body).toContain('<title>Notora</title>');
+    expect((await app.inject({ method: 'GET', url: '/dashboard' })).body).toContain('<title>Notora</title>');
+    expect((await app.inject({ method: 'GET', url: '/dashboard/' })).body).toContain('<title>Notora</title>');
     expect((await app.inject({ method: 'GET', url: '/api/absent' })).json()).toEqual({ error: 'Not found' });
   });
 

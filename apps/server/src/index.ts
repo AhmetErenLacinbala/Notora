@@ -9,6 +9,7 @@ import { MAX_UPLOAD_CHUNK_BYTES } from '../../../packages/shared/src/index.ts';
 import { defaultPdfTools, type PdfTools } from './pdf.ts';
 import { attachRelay } from './relay.ts';
 import { DocumentStore, UploadError } from './store.ts';
+import { attachDashboard, DashboardCatalog, type DashboardOptions } from './dashboard.ts';
 
 interface Options {
   dataDir?: string;
@@ -17,6 +18,7 @@ interface Options {
   storageBudgetMb?: number;
   revision?: string;
   pdfTools?: PdfTools;
+  dashboard?: DashboardOptions;
 }
 
 function positiveMegabytes(value: number | undefined, fallback: number): number {
@@ -53,6 +55,10 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
   const revision = options.revision ?? process.env.REVISION ?? 'dev';
   const store = new DocumentStore(dataDir, maxUploadBytes, storageBudgetBytes, options.pdfTools ?? defaultPdfTools());
   await store.initialize();
+  let catalog: DashboardCatalog;
+  try { catalog = new DashboardCatalog(dataDir, store.documents, options.dashboard?.now); }
+  catch (error) { store.close(); throw error; }
+  store.setDashboardCatalog(catalog);
   const app = Fastify({ logger: false });
 
   await app.register(multipart, {
@@ -60,9 +66,10 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
     throwFileSizeLimit: true,
   });
   app.addContentTypeParser('application/octet-stream', (_request, payload, done) => done(null, payload));
-  app.addHook('onClose', async () => { store.close(); });
+  app.addHook('onClose', async () => { store.close(); catalog.close(); });
 
   app.get('/healthz', async () => ({ status: 'ok', revision }));
+  attachDashboard(app, store, catalog, options.dashboard);
 
   app.post('/api/documents', async (request, reply) => {
     if (!request.isMultipart()) return reply.code(415).send({ error: 'Upload a PDF file' });
@@ -88,8 +95,8 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
 
   app.post('/api/uploads', async (request, reply) => {
     try {
-      const body = request.body as { filename?: unknown; size?: unknown } | null;
-      const session = await store.createUploadSession(body?.filename, body?.size);
+      const body = request.body as { filename?: unknown; size?: unknown; hostName?: unknown } | null;
+      const session = await store.createUploadSession(body?.filename, body?.size, body?.hostName);
       return reply.code(201).send(session);
     } catch (error) {
       const response = routeError(error);
@@ -150,6 +157,7 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
   app.get<{ Params: { id: string } }>('/api/documents/:id', async (request, reply) => {
     const auth = authorized(request.params.id, request.headers.authorization);
     if (auth.status !== 200) return reply.code(auth.status).send({ error: 'Document unavailable' });
+    store.recordDashboardAccess(auth.record.manifest.id);
     return reply.header('Cache-Control', 'private, no-store').send(auth.record.manifest);
   });
 
@@ -182,6 +190,7 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
       reply.header('Content-Type', 'application/pdf');
       reply.header('Content-Length', size);
       reply.header('ETag', etag);
+      store.recordDashboardAccess(manifest.id);
       if (request.headers['if-none-match'] === etag) return reply.code(304).send();
       return reply.send(createReadStream(path));
     },
@@ -199,6 +208,7 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
       }
       try {
         const links = await store.pageLinks(manifest.id, manifest.version, number);
+        store.recordDashboardAccess(manifest.id);
         return reply.send(links);
       } catch { return reply.code(404).send({ error: 'Page unavailable' }); }
     },
@@ -208,6 +218,8 @@ export async function createServer(options: Options = {}): Promise<{ app: Fastif
     await app.register(fastifyStatic, { root: webDir, prefix: '/', wildcard: false });
     app.get<{ Params: { documentId: string } }>('/r/:documentId', async (_request, reply) => reply.sendFile('index.html'));
     app.get<{ Params: { documentId: string } }>('/local/:documentId', async (_request, reply) => reply.sendFile('index.html'));
+    app.get('/dashboard', async (_request, reply) => reply.sendFile('index.html'));
+    app.get('/dashboard/', async (_request, reply) => reply.sendFile('index.html'));
   }
 
   app.setNotFoundHandler(async (_request, reply) => reply.code(404).send({ error: 'Not found' }));

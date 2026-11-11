@@ -385,6 +385,7 @@ export function attachRelay(server: FastifyInstance, store: DocumentStore): void
       preview: null, previewTokens: PREVIEW_BURST, previewBudgetAt: Date.now(),
     };
     room.peers.add(peer);
+    store.recordDashboardAccess?.(message.documentId, peer.owner ? peer.name : undefined);
     send(socket, { type: 'welcome', clientId: peer.id, participants: participants(room) });
     sendState(peer, INDEX_KEY);
     if (peer.owner) for (const key of room.docs.keys()) if (key !== INDEX_KEY) sendState(peer, key);

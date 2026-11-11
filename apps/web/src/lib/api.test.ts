@@ -148,14 +148,14 @@ describe('document API', () => {
       xhr.respond(200, { offset: state.offset });
     };
 
-    await expect(uploadPdf(file, percent => progress.push(percent))).resolves.toEqual(uploadResult);
+    await expect(uploadPdf(file, percent => progress.push(percent), 'Test Host')).resolves.toEqual(uploadResult);
     expect(UploadXHR.instances.map(xhr => (xhr.body as Blob).size).slice(0, 3))
       .toEqual([64 * 1024, 256 * 1024, MAX_UPLOAD_CHUNK_BYTES]);
     expect(progress.at(-1)).toBe(100);
     expect(progress.every((value, index) => index === 0 || value >= progress[index - 1])).toBe(true);
     expect(fetchMock.mock.calls[0][1]).toMatchObject({
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename: file.name, size: file.size }),
+      body: JSON.stringify({ filename: file.name, size: file.size, hostName: 'Test Host' }),
     });
     expect(fetchMock.mock.calls.at(-1)?.[1]).toMatchObject({
       method: 'POST', headers: { Authorization: 'Bearer upload-secret' },

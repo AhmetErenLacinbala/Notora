@@ -23,6 +23,15 @@ export interface DocumentManifest {
   pageCount: number; pages: PageInfo[]; outline: OutlineItem[]; error?: string;
   contentHash?: string;
 }
+export interface DashboardDocument {
+  id: string; title: string; hostName: string | null;
+  uploadedAt: number | null; lastAccessedAt: number | null;
+  sizeBytes: number; pageCount: number; status: DocumentManifest['status'];
+}
+export interface DashboardDocumentsResponse {
+  documents: DashboardDocument[]; total: number; offset: number; limit: number;
+}
+export interface DashboardSession { username: string }
 export interface UploadResult { documentId: string; accessToken: string; ownerToken: string }
 export const MAX_UPLOAD_CHUNK_BYTES = 1024 * 1024;
 export interface UploadSession { uploadId: string; uploadToken: string; offset: number }

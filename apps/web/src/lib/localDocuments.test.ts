@@ -105,10 +105,11 @@ describe('local PDF identity and sharing', () => {
     const record = await importLocalFile(new File(['%PDF-new'], 'New.pdf'));
     let finish!: (value: UploadResult) => void;
     vi.mocked(uploadPdf).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
-    const first = uploadLocalDocument(record.id);
+    const first = uploadLocalDocument(record.id, undefined, 'Test Host');
     const second = uploadLocalDocument(record.id);
     expect(first).toBe(second);
     await vi.waitFor(() => expect(uploadPdf).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(uploadPdf).mock.calls[0][2]).toBe('Test Host');
     finish(result);
     expect(await first).toEqual(result);
     expect(await second).toEqual(result);

@@ -6,6 +6,7 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { MAX_UPLOAD_CHUNK_BYTES, type DocumentManifest, type PageLink, type UploadResult, type UploadSession, type UploadStatus } from '../../../packages/shared/src/index.ts';
 import type { PdfTools } from './pdf.ts';
+import { cleanHostName } from './dashboard.ts';
 
 const ID_PATTERN = /^[0-9a-f]{32}$/;
 const PDF_HEADER = Buffer.from('%PDF-');
@@ -24,6 +25,7 @@ interface PendingUpload {
   busy: boolean;
   broken?: boolean;
   result?: UploadResult;
+  hostName?: string;
 }
 
 export interface DocumentRecord {
@@ -32,6 +34,12 @@ export interface DocumentRecord {
   ownerHash: string;
   uploadedBytes: number;
   createdAt: number;
+  hostName?: string;
+}
+
+interface DashboardCatalogSink {
+  upsertRecord(record: DocumentRecord): void;
+  recordAccess(record: DocumentRecord, verifiedOwnerName?: string): void;
 }
 
 export class UploadError extends Error {
@@ -101,6 +109,7 @@ export class DocumentStore {
   private idleResolvers: Array<() => void> = [];
   private fingerprints = new Map<string, Promise<{ sha256: string; size: number }>>();
   private fingerprintTail: Promise<unknown> = Promise.resolve();
+  private dashboardCatalog?: DashboardCatalogSink;
 
   constructor(
     readonly dataDir: string,
@@ -142,6 +151,15 @@ export class DocumentStore {
   }
 
   close(): void { if (this.uploadExpiryTimer) clearInterval(this.uploadExpiryTimer); }
+
+  setDashboardCatalog(catalog: DashboardCatalogSink): void { this.dashboardCatalog = catalog; }
+
+  recordDashboardAccess(id: string, verifiedOwnerName?: string): void {
+    const record = this.getRecord(id);
+    if (!record) return;
+    try { this.dashboardCatalog?.recordAccess(record, verifiedOwnerName); }
+    catch { /* A catalog write must not interrupt an authorized document session. */ }
+  }
 
   getRecord(id: string): DocumentRecord | undefined {
     return ID_PATTERN.test(id) ? this.documents.get(id) : undefined;
@@ -210,13 +228,15 @@ export class DocumentStore {
     if (!session.result) this.reservedBytes -= session.size + RECORD_RESERVE_BYTES;
   }
 
-  async createUploadSession(filename: unknown, size: unknown): Promise<UploadSession> {
+  async createUploadSession(filename: unknown, size: unknown, hostName?: unknown): Promise<UploadSession> {
     await this.expireIdleUploads();
     if (typeof filename !== 'string' || !filename.trim() || filename.length > 512
       || !Number.isSafeInteger(size) || (size as number) <= 0) {
       throw new UploadError(400, 'Provide a PDF filename and size');
     }
     if ((size as number) > this.maxUploadBytes) throw new UploadError(413, 'PDF exceeds upload limit');
+    const cleanName = hostName === undefined || hostName === null ? null : cleanHostName(hostName);
+    if (hostName !== undefined && hostName !== null && !cleanName) throw new UploadError(400, 'Invalid host name');
     if ([...this.uploads.values()].filter(session => !session.result).length >= MAX_ACTIVE_UPLOAD_SESSIONS
       || this.uploads.size >= MAX_ACTIVE_UPLOAD_SESSIONS + MAX_COMPLETED_UPLOAD_SESSIONS) {
       throw new UploadError(503, 'Too many uploads in progress');
@@ -227,7 +247,7 @@ export class DocumentStore {
     this.reserve(bytes);
     const session: PendingUpload = {
       id, tokenHash: hash(token).toString('hex'), filename, size: size as number,
-      offset: 0, lastActivity: Date.now(), busy: true,
+      offset: 0, lastActivity: Date.now(), busy: true, hostName: cleanName ?? undefined,
     };
     this.uploads.set(id, session);
     try {
@@ -302,7 +322,7 @@ export class DocumentStore {
         const { bytesRead } = await file.read(header, 0, header.length, 0);
         if (bytesRead !== PDF_HEADER.length || !header.equals(PDF_HEADER)) throw new UploadError(415, 'File is not a PDF');
       } finally { await file.close(); }
-      const result = await this.publish(this.uploadPath(id), session.filename, session.size);
+      const result = await this.publish(this.uploadPath(id), session.filename, session.size, session.hostName);
       this.reservedBytes -= session.size + RECORD_RESERVE_BYTES;
       session.result = result;
       this.enqueue(result.documentId);
@@ -331,7 +351,7 @@ export class DocumentStore {
     }
   }
 
-  private async publish(temporary: string, filename: string, bytes: number): Promise<UploadResult> {
+  private async publish(temporary: string, filename: string, bytes: number, hostName?: string): Promise<UploadResult> {
     const id = randomBytes(16).toString('hex');
     const accessToken = randomBytes(32).toString('base64url');
     const ownerToken = randomBytes(32).toString('base64url');
@@ -349,7 +369,7 @@ export class DocumentStore {
       };
       const record: DocumentRecord = {
         manifest, accessHash: hash(accessToken).toString('hex'), ownerHash: hash(ownerToken).toString('hex'),
-        uploadedBytes: bytes, createdAt: Date.now(),
+        uploadedBytes: bytes, createdAt: Date.now(), hostName,
       };
       const recordBytes = Buffer.byteLength(JSON.stringify(record));
       if (recordBytes > RECORD_RESERVE_BYTES) throw new UploadError(507, 'Document storage is full');
@@ -357,6 +377,8 @@ export class DocumentStore {
       published = true;
       this.usedBytes += bytes + recordBytes;
       this.documents.set(id, record);
+      try { this.dashboardCatalog?.upsertRecord(record); }
+      catch { /* The durable document remains available; startup can rebuild catalog metadata. */ }
       return { documentId: id, accessToken, ownerToken };
     } finally {
       if (!published) await rm(documentDir, { recursive: true, force: true });

@@ -10,13 +10,21 @@ The workspace behaves like a canvas. Scroll or use a trackpad to pan; Command/Ct
 
 ## Storage
 
-- **Server (after explicit upload):** original PDF, individual page PDFs, page sizes, navigation metadata, and hashed access tokens. Docker stores these in the `notora-data` volume.
-- **Browser:** local PDF Blobs, display name, creator-only recent documents, camera position, requested PDF page cache, and Yjs note/drawing state in IndexedDB. Opening a shared link never adds it to the guest's recent list. Local PDF metadata is stored separately from its Blob, so listing history does not load the files. SHA-256 content identity reuses an earlier local/shared session even if the filename changes.
+- **Server (after explicit upload):** original PDF, individual page PDFs, page sizes, navigation metadata, hashed access tokens, and a small SQLite dashboard metadata database. Docker stores these in the `notora-data` volume.
+- **Creator browser:** local PDF Blobs, display name, creator-only recent documents, camera position, requested PDF page cache, and Yjs note/drawing state in IndexedDB. Guests keep document data in session RAM and retain only their small display-name profile; opening a shared link never adds it to their recent list. Local PDF metadata is stored separately from its Blob, so listing history does not load the files. SHA-256 content identity reuses an earlier local/shared session even if the filename changes.
 - **Live session:** text, final drawing updates, transient stroke previews and cursor positions travel through WebSocket. The server holds shared annotation state only in memory and releases it when the last participant leaves.
 
 Editing is immediate. Annotation persistence waits for **10 seconds without input**; hiding or closing the workspace attempts an earlier flush. Continuous input can postpone saving. A crash before a successful flush can lose unsaved changes. Freehand samples are fitted to piecewise cubic Bézier curves on release using least squares, bounded refinement and recursive error splitting. Final geometry is stored as compact float32 bytes; in-progress samples are transient and never saved as a second copy.
 
 Uploaded PDFs remain available when the creator is offline, but annotations can only be restored from a browser that has saved them. Clearing that browser's site data removes its local PDFs, annotations and creator history. An access link grants reading and editing to anyone holding it; names do not establish ownership. The owner's additional token stays in their browser.
+
+## Private dashboard
+
+Open `/dashboard` directly to sign in to the operator panel. It lists uploaded PDFs, the creator/host name, upload time, and last access time. Times use the browser's local time zone. Historic host names and access timestamps that were not recorded appear as **Not recorded**; a subsequent verified owner visit fills the host name. A guest cannot replace it. The operator login is separate from document-owner permissions and never grants document capabilities to visitors.
+
+Configure `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD_HASH` only in the VPS `.env`. The hash format is `scrypt:<salt hex>:<digest hex>`: 16 random salt bytes, decoded from hex before deriving a 64-byte key with Node's default scrypt parameters (N=16384, r=8, p=1). Keep the file private and never commit credentials. Login fails closed when configuration is absent. `PUBLIC_ORIGIN` identifies the allowed browser origin; Compose already sets the production HTTPS origin.
+
+Sessions use expiring HttpOnly cookies, Secure in production, and are revoked on logout or server restart. Dashboard metadata is stored in `/data/dashboard.sqlite3` inside the existing volume. It contains no PDF bytes or annotations. Back up the whole volume consistently, including SQLite sidecar files, or use a SQLite backup while the service is running.
 
 ## Large PDFs
 
@@ -94,4 +102,4 @@ The shared types in `packages/shared/src/index.ts` and [implementation contract]
 
 ## Stack
 
-React + TypeScript + Vite, PDF.js, IndexedDB (`idb`), incremental SHA-256 (`@noble/hashes`), Yjs, Fastify, WebSocket (`ws`), qpdf, and pypdf. One Node process serves the API, WebSocket, and built frontend from a single container.
+React + TypeScript + Vite, PDF.js, IndexedDB (`idb`), incremental SHA-256 (`@noble/hashes`), Yjs, Fastify, WebSocket (`ws`), Node's built-in SQLite, qpdf, and pypdf. One Node process serves the API, WebSocket, and built frontend from a single container.

@@ -7,11 +7,13 @@ import { buildViewUrl, parseSharedView, type SharedView } from './lib/shareLink'
 import { clearGuestPageCache, getLocalBlob, getLocalDocument, getOwnedProject, getProfile, listLocalDocuments, listOwnedProjects, saveOwnedProject, saveProfile, updateLocalManifest, type LocalDocumentRecord } from './lib/storage';
 
 const Workspace = lazy(async () => ({ default: (await import('./components/Workspace')).Workspace }));
+const Dashboard = lazy(async () => ({ default: (await import('./components/Dashboard')).Dashboard }));
 
-type Route = { kind: 'remote'; documentId: string; token: string; view?: SharedView } | { kind: 'local'; id: string; view?: SharedView } | null;
+type Route = { kind: 'dashboard' } | { kind: 'remote'; documentId: string; token: string; view?: SharedView } | { kind: 'local'; id: string; view?: SharedView } | null;
 type Recent = { kind: 'local'; record: LocalDocumentRecord } | { kind: 'remote'; project: OwnedProject };
 
 function currentRoute(): Route {
+  if (/^\/dashboard\/?$/.test(window.location.pathname)) return { kind: 'dashboard' };
   const local = window.location.pathname.match(/^\/local\/(local-[a-f0-9]{64})\/?$/);
   if (local) return { kind: 'local', id: local[1], view: parseSharedView(window.location.search) };
   const remote = window.location.pathname.match(/^\/r\/([A-Za-z0-9_-]+)\/?$/);
@@ -22,6 +24,7 @@ function currentRoute(): Route {
 }
 
 function routeUrl(route: NonNullable<Route>): string {
+  if (route.kind === 'dashboard') return '/dashboard';
   const path = route.kind === 'local' ? `/local/${route.id}` : `/r/${encodeURIComponent(route.documentId)}#${encodeURIComponent(route.token)}`;
   return route.view ? buildViewUrl(new URL(path, window.location.origin).href, route.view) : path;
 }
@@ -41,12 +44,13 @@ export default function App() {
   const fileInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+    if (route?.kind === 'dashboard') return;
     let live = true;
     getProfile().then(value => { if (live) setProfile(value); }).catch(error => {
       if (live) setStartupError(errorText(error));
     });
     return () => { live = false; };
-  }, [startupAttempt]);
+  }, [startupAttempt, route?.kind]);
 
   useEffect(() => {
     const updateRoute = () => setRoute(currentRoute());
@@ -101,6 +105,7 @@ export default function App() {
     }
   };
 
+  if (route?.kind === 'dashboard') return <Suspense fallback={<div className="app-loading" role="status">notora<span>.</span></div>}><Dashboard /></Suspense>;
   if (profile === undefined && startupError) return <div className="name-shell"><main className="name-panel"><span className="brand">notora<span>.</span></span><h1>Couldn’t open local storage</h1><p role="alert">{startupError}</p><button type="button" className="primary-button" onClick={() => { setStartupError(''); setStartupAttempt(attempt => attempt + 1); }}>Try again</button></main></div>;
   if (profile === undefined) return <div className="app-loading" aria-label="Loading Notora">notora<span>.</span></div>;
   if (profile === null) return <NameGate onSubmit={submitName} initialError={homeError} />;
@@ -181,7 +186,7 @@ function LocalDocumentRoute({ id, profile, onHome, onRemote, initialView }: { id
     setUploadError('');
     setUploadState({ status: 'uploading', progress: 0 });
     try {
-      const result = await uploadLocalDocument(id, progress => setUploadState({ status: 'uploading', progress }));
+      const result = await uploadLocalDocument(id, progress => setUploadState({ status: 'uploading', progress }), profile.name);
       setUploadState({ status: 'processing', progress: 100 });
       await beforeTransition?.();
       onRemote(result);

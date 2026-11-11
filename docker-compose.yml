@@ -10,6 +10,8 @@ services:
       PORT: 3000
       DATA_DIR: /data
       PUBLIC_ORIGIN: https://notora.lacinbala.com
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-}
+      DASHBOARD_PASSWORD_HASH: ${DASHBOARD_PASSWORD_HASH:-}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-256}
       MAX_STORAGE_MB: ${MAX_STORAGE_MB:-2048}
     volumes:
