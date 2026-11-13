@@ -44,5 +44,8 @@ Meaningful tests for geometric approximation/corners/duplicates/encoding, drawin
 - Local SPA route is /local/:documentId. Fingerprint endpoint also requires x-owner-token; it is an owner-only migration aid.
 
 ## Ink completion and compact notes
+
+Primary stylus contact (`pointerType: 'pen'`) on workspace content starts a freehand stroke immediately, independently of the toolbar selection. It never changes the selected tool; mouse and finger input continue to use that selection. Intercept pen contact before PDF links, text and note borders consume it, while leaving toolbar controls usable. Ignore competing touch input during a pen stroke so it cannot replace the stroke or move the camera; ordinary touch behavior resumes after those contacts lift. Pen-generated clicks/double-clicks must not navigate links or create text notes.
+
 Completed geometry paints in a layout effect before the active-preview canvas clears, so pen-up and lazy restoration never depend on a later passive paint. A browser pointercancel or unexpected lostpointercapture commits the samples already collected without adding synthetic endpoint coordinates. A no-motion double-press only creates text on a real pointerup; intentional two-finger pinch still discards the provisional stroke. Ignore wheel momentum while inking.
 Note padding is 2 canonical units; width follows measured literal lines with 2 units of caret slack and no 32-unit minimum. Drag handles extend outward and stop before the textarea, including at font size 1. Shared noteHeight and selection bounds use the same padding.

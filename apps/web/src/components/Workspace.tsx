@@ -97,6 +97,7 @@ type Tool = 'pen' | 'arrow' | 'eraser' | 'text' | null;
 
 interface ActiveDrawing {
   pointerId: number;
+  pointerType: string;
   id: string;
   kind: 'stroke' | 'arrow';
   anchorPage: number;
@@ -175,6 +176,8 @@ function WorkspaceContent({ manifest, accessToken, ownerToken, onHome, storageId
   const panRef = useRef<PanDrag | null>(null);
   const drawingLayerRef = useRef<DrawingLayerHandle>(null);
   const activeDrawing = useRef<ActiveDrawing | null>(null);
+  const ignoredPointers = useRef(new Set<number>());
+  const lastPointerDownType = useRef('');
   const eraserPointer = useRef<number | null>(null);
   const erasedIds = useRef(new Set<string>());
   const pressCandidate = useRef<PressCandidate | null>(null);
@@ -477,7 +480,7 @@ function WorkspaceContent({ manifest, accessToken, ownerToken, onHome, storageId
     event.currentTarget.focus({ preventScroll: true });
     event.currentTarget.setPointerCapture(event.pointerId);
     const active: ActiveDrawing = {
-      pointerId: event.pointerId, id: crypto.randomUUID(), kind,
+      pointerId: event.pointerId, pointerType: event.pointerType, id: crypto.randomUUID(), kind,
       anchorPage: page.number, x: stage.x - page.x, y: stage.y - page.y,
       points: [{ x: 0, y: 0 }], stagePoints: [stage],
       nextPreviewPoint: 1, previewSeq: 1, lastPreviewAt: performance.now(),
@@ -557,6 +560,7 @@ function WorkspaceContent({ manifest, accessToken, ownerToken, onHome, storageId
   const finishDrawing = (event: React.PointerEvent<HTMLDivElement>) => {
     const drawing = activeDrawing.current;
     if (!drawing || drawing.pointerId !== event.pointerId) return;
+    if (drawing.pointerType === 'pen') suppressDoubleClickUntil.current = performance.now() + 700;
     if (event.type === 'pointerup') sampleDrawing(event);
     try {
       // Keep the samples already drawn if the browser interrupts capture.
@@ -667,6 +671,57 @@ function WorkspaceContent({ manifest, accessToken, ownerToken, onHome, storageId
     if (ids.size !== current.size || [...ids].some(id => !current.has(id))) selectIds(ids);
   };
 
+  const ignorePointerDuringPen = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drawing = activeDrawing.current;
+    if (!ignoredPointers.current.has(event.pointerId) &&
+        !(drawing?.pointerType === 'pen' && drawing.pointerId !== event.pointerId)) return false;
+    if (event.type === 'pointerdown') {
+      ignoredPointers.current.add(event.pointerId);
+      event.currentTarget.setPointerCapture(event.pointerId);
+    }
+    if (event.type === 'pointerup' || event.type === 'pointercancel') ignoredPointers.current.delete(event.pointerId);
+    event.preventDefault();
+    event.stopPropagation();
+    return true;
+  };
+
+  const captureViewportPointer = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (activeDrawing.current?.pointerType !== 'pen') ignoredPointers.current.delete(event.pointerId);
+    if (ignorePointerDuringPen(event)) return;
+    lastPointerDownType.current = event.pointerType;
+    if (event.pointerType !== 'pen' || event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (activeDrawing.current?.pointerType === 'pen') return;
+    // Pen contact takes precedence over a resting finger or an unfinished touch gesture.
+    for (const pointerId of [
+      ...touches.current.keys(), activeDrawing.current?.pointerId, panRef.current?.pointerId,
+      marqueeRef.current?.pointerId, dragRef.current?.pointerId, eraserPointer.current,
+    ]) {
+      if (pointerId != null && pointerId !== event.pointerId) ignoredPointers.current.add(pointerId);
+    }
+    clearDrawing();
+    touches.current.clear();
+    pinchRef.current = null;
+    touchGesture.current = false;
+    panRef.current = null;
+    marqueeRef.current = null;
+    dragRef.current = null;
+    eraserPointer.current = null;
+    erasedIds.current.clear();
+    pressCandidate.current = null;
+    setMarquee(null);
+    suppressDoubleClickUntil.current = performance.now() + 700;
+    beginDrawing(event, 'stroke', false);
+  };
+
+  const suppressPenClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    const pointerType = (event.nativeEvent as PointerEvent).pointerType;
+    if (pointerType !== 'pen' && !(lastPointerDownType.current === 'pen' && event.detail > 0)) return;
+    event.preventDefault();
+    event.stopPropagation();
+  };
+
   const beginViewportPointer = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.pointerType === 'touch') {
       touches.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
@@ -767,6 +822,7 @@ function WorkspaceContent({ manifest, accessToken, ownerToken, onHome, storageId
   };
 
   const endViewportPointer = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (ignorePointerDuringPen(event)) return;
     if (event.pointerType === 'touch') {
       touches.current.delete(event.pointerId);
       if (pinchRef.current) {
@@ -900,6 +956,8 @@ function WorkspaceContent({ manifest, accessToken, ownerToken, onHome, storageId
   };
 
   const setPointerCursor = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (ignoredPointers.current.has(event.pointerId) ||
+        (activeDrawing.current?.pointerType === 'pen' && activeDrawing.current.pointerId !== event.pointerId)) return;
     const rect = event.currentTarget.getBoundingClientRect();
     if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) {
       clearPointerCursor();
@@ -1000,7 +1058,7 @@ function WorkspaceContent({ manifest, accessToken, ownerToken, onHome, storageId
     </header>
     <div className="workspace-main">
       {outlineOpen && <aside className="outline-panel"><div className="outline-heading"><h2>Outline</h2><button type="button" aria-label="Close outline" onClick={() => setOutlineOpen(false)}>×</button></div>{manifest.outline.length ? <nav aria-label="PDF outline"><OutlineList items={manifest.outline} depth={0} onDestination={moveTo} /></nav> : <p className="outline-empty">No outline in this PDF.</p>}</aside>}
-      <div className="viewer-wrap"><div className="viewer-viewport" ref={viewportRef} tabIndex={-1} onPointerDown={beginViewportPointer} onPointerEnter={setPointerCursor} onPointerMove={event => { moveViewportPointer(event); setPointerCursor(event); }} onPointerUp={endViewportPointer} onPointerCancel={endViewportPointer} onLostPointerCapture={endViewportPointer} onPointerLeave={clearPointerCursor} onDoubleClick={createAtPointer} onAuxClick={event => { if (event.button === 1) event.preventDefault(); }} aria-label={`${manifest.title} pages`}>
+      <div className="viewer-wrap"><div className="viewer-viewport" ref={viewportRef} tabIndex={-1} onPointerDownCapture={captureViewportPointer} onPointerMoveCapture={ignorePointerDuringPen} onPointerUpCapture={ignorePointerDuringPen} onPointerCancelCapture={ignorePointerDuringPen} onClickCapture={suppressPenClick} onDoubleClickCapture={suppressPenClick} onPointerDown={beginViewportPointer} onPointerEnter={setPointerCursor} onPointerMove={event => { moveViewportPointer(event); setPointerCursor(event); }} onPointerUp={endViewportPointer} onPointerCancel={endViewportPointer} onLostPointerCapture={endViewportPointer} onPointerLeave={clearPointerCursor} onDoubleClick={createAtPointer} onAuxClick={event => { if (event.button === 1) event.preventDefault(); }} aria-label={`${manifest.title} pages`}>
           <div className="pdf-stage" style={{ width: size.width, height: size.height, transform: `translate(${-camera.scrollLeft}px, ${-camera.scrollTop}px) scale(${zoom})` }}>
             {renderedPages.map(page => <PdfPage key={`${manifest.version}:${page.number}`} page={page} documentId={manifest.id} version={manifest.version} accessToken={accessToken} ownerToken={ownerToken} localPdf={localPdf} zoom={zoom} active={nearbyPageNumbers.has(page.number)} retain={desktop} onReady={onPageReady} onDestination={moveTo} />)}
             <div className="notes-layer" aria-label="Notes">{visibleNotes.map(note => <NoteEditor
