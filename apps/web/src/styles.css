@@ -86,18 +86,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .zoom-group button:hover:not(:disabled) { color: #b35b40; background: #f8f5f1; }
 .zoom-group button:disabled { opacity: .35; }
 .zoom-group span { width: 43px; text-align: center; font-size: 11px; font-variant-numeric: tabular-nums; }
-.share-button { height: 31px; padding: 0 11px; border-color: #d6d4ce; background: #fff; color: #454842; }
-.share-button:hover { border-color: #b9b6ad; background: #f8f7f3; }
-.share-wrap { position: relative; }
-.share-popover { position: absolute; right: 0; top: 42px; z-index: 30; width: 320px; padding: 17px; border: 1px solid #e0ded6; border-radius: 7px; background: #fff; box-shadow: 0 10px 30px #22221b1a; }
-.share-popover strong { font-size: 13px; }
-.share-popover p { margin: 6px 0 15px; color: #777970; font-size: 12px; line-height: 1.5; }
-.share-link-row { display: flex; gap: 6px; }
-.share-link-row input { flex: 1; min-width: 0; padding: 0 8px; border: 1px solid #deddd6; border-radius: 4px; color: #666860; font-size: 11px; }
-.share-link-row button { height: 30px; padding: 0 10px; border: 1px solid #b65c43; border-radius: 4px; background: #b65c43; color: #fff; font-size: 11px; font-weight: 650; }
-.share-upload-button { width: 100%; min-height: 36px; }
-.share-upload-state { margin-top: 10px; color: #696b65; font-size: 12px; }
-.share-error { margin-top: 10px !important; }
+/* App-specific names keep document collaboration distinct from social-widget filters. */
+.notora-collaboration-button { height: 31px; padding: 0 11px; border-color: #d6d4ce; background: #fff; color: #454842; }
+.notora-collaboration-button:hover { border-color: #b9b6ad; background: #f8f7f3; }
+.notora-collaboration-wrap { position: relative; }
+.notora-collaboration-popover { position: absolute; right: 0; top: 42px; z-index: 30; width: 320px; padding: 17px; border: 1px solid #e0ded6; border-radius: 7px; background: #fff; box-shadow: 0 10px 30px #22221b1a; }
+.notora-collaboration-popover strong { font-size: 13px; }
+.notora-collaboration-popover p { margin: 6px 0 15px; color: #777970; font-size: 12px; line-height: 1.5; }
+.notora-collaboration-link-row { display: flex; gap: 6px; }
+.notora-collaboration-link-row input { flex: 1; min-width: 0; padding: 0 8px; border: 1px solid #deddd6; border-radius: 4px; color: #666860; font-size: 11px; }
+.notora-collaboration-link-row button { height: 30px; padding: 0 10px; border: 1px solid #b65c43; border-radius: 4px; background: #b65c43; color: #fff; font-size: 11px; font-weight: 650; }
+.notora-collaboration-upload-button { width: 100%; min-height: 36px; }
+.notora-collaboration-upload-state { margin-top: 10px; color: #696b65; font-size: 12px; }
+.notora-collaboration-error { margin-top: 10px !important; }
 .workspace-presence { flex: 1; justify-content: flex-end; gap: 9px; }
 .participant-list { display: flex; align-items: center; min-width: 0; max-width: 245px; overflow: auto hidden; scrollbar-width: none; }
 .participant-list::-webkit-scrollbar { display: none; }
@@ -251,7 +252,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
   .workspace-header { gap: 8px; padding: 0 12px; }
   .workspace-left { gap: 9px; }
   .workspace-actions { gap: 6px; }
-  .participant-name, .save-status, .share-separator { display: none; }
+  .participant-name, .save-status, .notora-collaboration-separator { display: none; }
   .participant-pill { padding-right: 2px; }
   .participant-list { max-width: 145px; }
 }
@@ -265,5 +266,5 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
   .outline-toggle span { display: none; }
   .outline-panel { position: absolute; z-index: 10; top: 0; bottom: 0; width: min(270px, 85vw); box-shadow: 5px 0 14px #2222; }
   .workspace-main { position: relative; }
-  .share-popover { position: fixed; right: 10px; top: 86px; width: min(320px, 90vw); }
+  .notora-collaboration-popover { position: fixed; right: 10px; top: 86px; width: min(320px, 90vw); }
 }
